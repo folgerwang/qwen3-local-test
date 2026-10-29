@@ -1,0 +1,31 @@
+// Per token: optionally x += delta, then out = rmsnorm(x) * (1 + w). One workgroup per token.
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t x, delta, w, out_;
+    uint dim;
+    float eps;
+} pc;
+
+shared float red[8];
+
+void main() {
+    const uint t = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
+    F32 x = F32(pc.x + uint64_t(t) * pc.dim * 4u);
+    float ss = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256u) {
+        float v = x.v[i];
+        if (pc.delta != 0ul) { v += F32(pc.delta + uint64_t(t) * pc.dim * 4u).v[i]; x.v[i] = v; }
+        ss += v * v;
+    }
+    ss = subgroupAdd(ss);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = ss;
+    barrier();
+    float tot = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; i++) tot += red[i];
+    const float r = inversesqrt(tot / float(pc.dim) + pc.eps);
+    F32 o = F32(pc.out_ + uint64_t(t) * pc.dim * 4u);
+    for (uint i = tid; i < pc.dim; i += 256u) o.v[i] = x.v[i] * r * (1.0 + F32(pc.w).v[i]);
+}

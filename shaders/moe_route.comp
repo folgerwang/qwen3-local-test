@@ -1,0 +1,81 @@
+// MoE router: per token, softmax over expert logits (fp32), top-k by probability (ties -> lower index),
+// renormalized weights. Writes selected ids (host-visible, for cache bookkeeping) and weights.
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+#define PER 4  // experts per thread (n_experts <= 1024)
+
+layout(push_constant) uniform PC {
+    uint64_t logits, sel, selw;
+    uint n_experts, top_k;
+} pc;
+
+shared float s_val[8];
+shared uint s_idx[8];
+
+float block_max(float v) {
+    v = subgroupMax(v);
+    if (gl_SubgroupInvocationID == 0u) s_val[gl_SubgroupID] = v;
+    barrier();
+    float r = s_val[0];
+    for (uint i = 1; i < gl_NumSubgroups; i++) r = max(r, s_val[i]);
+    barrier();
+    return r;
+}
+float block_sum(float v) {
+    v = subgroupAdd(v);
+    if (gl_SubgroupInvocationID == 0u) s_val[gl_SubgroupID] = v;
+    barrier();
+    float r = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; i++) r += s_val[i];
+    barrier();
+    return r;
+}
+
+void main() {
+    const uint t = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x, E = pc.n_experts;
+    F32 lg = F32(pc.logits + uint64_t(t) * E * 4u);
+    float p[PER];
+    float mx = -1e30;
+    [[unroll]] for (uint j = 0; j < PER; j++) {
+        const uint e = tid + 256u * j;
+        p[j] = e < E ? lg.v[e] : -1e30;
+        mx = max(mx, p[j]);
+    }
+    mx = block_max(mx);
+    float s = 0.0;
+    [[unroll]] for (uint j = 0; j < PER; j++) {
+        const uint e = tid + 256u * j;
+        p[j] = e < E ? exp(p[j] - mx) : 0.0;
+        s += p[j];
+    }
+    s = block_sum(s);
+    [[unroll]] for (uint j = 0; j < PER; j++) p[j] = (tid + 256u * j) < E ? p[j] / s : -1.0;
+
+    float chosen_p = 0.0, total = 0.0;
+    uint chosen_e = 0u;
+    for (uint k = 0; k < pc.top_k; k++) {
+        float bv = -1.0;
+        uint bi = 0xFFFFFFFFu;
+        [[unroll]] for (uint j = 0; j < PER; j++)
+            if (p[j] > bv) { bv = p[j]; bi = tid + 256u * j; }  // ascending e within a thread: first max wins
+        const float m = subgroupMax(bv);
+        const uint mi = subgroupMin(bv == m ? bi : 0xFFFFFFFFu);
+        if (gl_SubgroupInvocationID == 0u) { s_val[gl_SubgroupID] = m; s_idx[gl_SubgroupID] = mi; }
+        barrier();
+        float M = s_val[0];
+        uint I = s_idx[0];
+        for (uint i = 1; i < gl_NumSubgroups; i++)
+            if (s_val[i] > M || (s_val[i] == M && s_idx[i] < I)) { M = s_val[i]; I = s_idx[i]; }
+        barrier();
+        [[unroll]] for (uint j = 0; j < PER; j++)
+            if (tid + 256u * j == I) p[j] = -1.0;
+        if (tid == k) { chosen_p = M; chosen_e = I; }
+        total += M;
+    }
+    if (tid < pc.top_k) {
+        F32(pc.selw).v[t * pc.top_k + tid] = chosen_p / total;
+        U32W(pc.sel).v[t * pc.top_k + tid] = chosen_e;
+    }
+}

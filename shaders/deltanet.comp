@@ -1,0 +1,69 @@
+// Gated delta rule recurrence. Workgroup = (v-head h, slice of 16 value columns); 128 threads as
+// 16 columns x 8 key-groups, each thread keeps 16 state entries S[k][v] in registers.
+//   S *= exp(g); kv = S^T k; d = (v - kv) * beta; S += k d^T; o = S^T q
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 128) in;
+#define KD 128
+#define DV 128
+#define VS 16
+#define KG 8
+#define KPER (KD / KG)
+
+layout(push_constant) uniform PC {
+    uint64_t qkv, a, b, neg_a, dt_bias, state, out_;
+    uint n, conv_dim, key_dim, n_v_heads, ratio;
+} pc;
+
+shared float qs[KD], ks[KD], part[KG][VS], dsh[VS], red[8];
+
+void main() {
+    const uint h = gl_WorkGroupID.x, vs = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+    const uint col = tid % VS, kg = tid / VS;
+    const uint kh = h / pc.ratio, vcol = vs * VS + col;
+    F32 st = F32(pc.state + uint64_t(h) * KD * DV * 4u);
+    float S[KPER];
+    [[unroll]] for (uint i = 0; i < KPER; i++) S[i] = st.v[(kg * KPER + i) * DV + vcol];
+    const float negA = F32(pc.neg_a).v[h], dtb = F32(pc.dt_bias).v[h];
+    const float qscale = inversesqrt(float(KD));
+
+    for (uint t = 0; t < pc.n; t++) {
+        F32 row = F32(pc.qkv + uint64_t(t) * pc.conv_dim * 4u);
+        const float qv = row.v[kh * KD + tid], kv_ = row.v[pc.key_dim + kh * KD + tid];
+        // l2 norms of q and k (128 threads = KD)
+        const float sq = subgroupAdd(qv * qv), sk = subgroupAdd(kv_ * kv_);
+        if (gl_SubgroupInvocationID == 0u) { red[gl_SubgroupID] = sq; red[4u + gl_SubgroupID] = sk; }
+        barrier();
+        float nq = 0.0, nk = 0.0;
+        for (uint i = 0; i < gl_NumSubgroups; i++) { nq += red[i]; nk += red[4u + i]; }
+        qs[tid] = qv * inversesqrt(nq + 1e-6) * qscale;
+        ks[tid] = kv_ * inversesqrt(nk + 1e-6);
+        barrier();
+
+        const float beta = sigmoid(F32(pc.b).v[t * pc.n_v_heads + h]);
+        const float decay = exp(negA * softplus(F32(pc.a).v[t * pc.n_v_heads + h] + dtb));
+        float p = 0.0;
+        [[unroll]] for (uint i = 0; i < KPER; i++) { S[i] *= decay; p += S[i] * ks[kg * KPER + i]; }
+        part[kg][col] = p;
+        barrier();
+        if (kg == 0u) {
+            float kvm = 0.0;
+            [[unroll]] for (uint g = 0; g < KG; g++) kvm += part[g][col];
+            dsh[col] = (row.v[2u * pc.key_dim + h * DV + vcol] - kvm) * beta;
+        }
+        barrier();
+        const float d = dsh[col];
+        p = 0.0;
+        [[unroll]] for (uint i = 0; i < KPER; i++) { S[i] += ks[kg * KPER + i] * d; p += S[i] * qs[kg * KPER + i]; }
+        part[kg][col] = p;
+        barrier();
+        if (kg == 0u) {
+            float o = 0.0;
+            [[unroll]] for (uint g = 0; g < KG; g++) o += part[g][col];
+            F32(pc.out_ + uint64_t(t) * pc.n_v_heads * DV * 4u).v[h * DV + vcol] = o;
+        }
+        barrier();
+    }
+    [[unroll]] for (uint i = 0; i < KPER; i++) st.v[(kg * KPER + i) * DV + vcol] = S[i];
+}

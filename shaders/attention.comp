@@ -1,0 +1,52 @@
+// Split-K causal GQA attention, head_dim 256. Workgroup = (token, head, key split). 8 subgroups each
+// stream a strided subset of the split's keys with an online softmax (lanes hold 8 dims each); the
+// workgroup then merges them and writes an unnormalized partial (max m, sum l, o[256]) for attn_combine.
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+#define D 256
+#define PART (D + 2)
+layout(push_constant) uniform PC {
+    uint64_t q, kcache, vcache, part;
+    uint pos, n_heads, n_kv, chunk, n_split;
+    float scale;
+} pc;
+
+shared float sm[8], sl[8];
+shared float sacc[8][D];
+
+void main() {
+    const uint t = gl_WorkGroupID.x, h = gl_WorkGroupID.y, z = gl_WorkGroupID.z;
+    const uint sg = gl_SubgroupID, lane = gl_SubgroupInvocationID, tid = gl_LocalInvocationID.x;
+    const uint kvh = h / (pc.n_heads / pc.n_kv), len = pc.pos + t + 1u;
+    const uint jb = z * pc.chunk, je = min(len, jb + pc.chunk);
+    F4 q4 = F4(pc.q + uint64_t((t * pc.n_heads + h) * D) * 4u);
+    const vec4 qa = q4.v[lane * 2u] * pc.scale, qb = q4.v[lane * 2u + 1u] * pc.scale;
+    float m = -1e30, l = 0.0;
+    vec4 oa = vec4(0.0), ob = vec4(0.0);
+    for (uint j = jb + sg; j < je; j += 8u) {
+        const uint64_t off = uint64_t((j * pc.n_kv + kvh) * D) * 4u;
+        F4 k4 = F4(pc.kcache + off), v4 = F4(pc.vcache + off);
+        const float s = subgroupAdd(dot(qa, k4.v[lane * 2u]) + dot(qb, k4.v[lane * 2u + 1u]));
+        const float mn = max(m, s), corr = exp(m - mn), p = exp(s - mn);
+        l = l * corr + p;
+        oa = oa * corr + p * v4.v[lane * 2u];
+        ob = ob * corr + p * v4.v[lane * 2u + 1u];
+        m = mn;
+    }
+    if (lane == 0u) { sm[sg] = m; sl[sg] = l; }
+    [[unroll]] for (uint i = 0; i < 4u; i++) { sacc[sg][lane * 8u + i] = oa[i]; sacc[sg][lane * 8u + 4u + i] = ob[i]; }
+    barrier();
+    float M = -1e30;
+    for (uint i = 0; i < 8u; i++) if (sl[i] > 0.0) M = max(M, sm[i]);
+    float L = 0.0, o = 0.0;
+    for (uint i = 0; i < 8u; i++) {
+        const float c = sl[i] > 0.0 ? exp(sm[i] - M) : 0.0;
+        L += sl[i] * c;
+        o += sacc[i][tid] * c;
+    }
+    F32 part = F32(pc.part + uint64_t(((t * pc.n_heads + h) * pc.n_split + z) * PART) * 4u);
+    part.v[2u + tid] = o;
+    if (tid == 0u) { part.v[0] = M; part.v[1] = L; }
+}

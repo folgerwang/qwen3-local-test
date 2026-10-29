@@ -1,0 +1,15 @@
+// Fills the weights of the combine table (row, weight) from the router output: comb[2i + 1] = selw[i].
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t comb, selw;
+    uint n;
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    U32W(pc.comb).v[2u * i + 1u] = floatBitsToUint(F32(pc.selw).v[i]);
+}

@@ -1,0 +1,84 @@
+// MoE grouping (single workgroup): bucket the n*top_k (token, expert) selections by expert and emit
+//   toks[r]        token id of grouped row r (rows of one expert are contiguous)
+//   comb[i]        (row, weight) for selection i = t*top_k + k, used by moe_combine
+//   entries[]      {expert base address, first row, row count}, at most `chunk` rows each
+//   args           two VkDispatchIndirectCommand (gate/up and down projections)
+// The expert base address comes from the per-layer location table (VRAM cache slot or pinned host copy).
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+#define MAXE 1024
+
+struct Entry { uint64_t base; uint start, count; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Entries { Entry e[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Locs { uint64_t v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t sel, selw, loc, entries, toks, comb, args;
+    uint n_sel, top_k, n_experts, chunk, gx_up, gx_down;
+} pc;
+
+shared uint cnt[MAXE], off[MAXE], eoff[MAXE];
+shared uint sg_rows[8], sg_ent[8], fill[MAXE];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, E = pc.n_experts;
+    U32 sel = U32(pc.sel);
+    for (uint e = tid; e < E; e += 256u) cnt[e] = 0u;
+    barrier();
+    for (uint i = tid; i < pc.n_sel; i += 256u) atomicAdd(cnt[sel.v[i]], 1u);
+    barrier();
+    // parallel exclusive scans over experts; thread tid owns experts [tid*per, tid*per + per)
+    const uint per = (E + 255u) / 256u, e0 = tid * per;
+    uint my_rows = 0u, my_ent = 0u;
+    for (uint e = e0; e < min(E, e0 + per); e++) { my_rows += cnt[e]; my_ent += (cnt[e] + pc.chunk - 1u) / pc.chunk; }
+    const uint ex_rows = subgroupExclusiveAdd(my_rows), ex_ent = subgroupExclusiveAdd(my_ent);
+    if (gl_SubgroupInvocationID == 31u) { sg_rows[gl_SubgroupID] = ex_rows + my_rows; sg_ent[gl_SubgroupID] = ex_ent + my_ent; }
+    barrier();
+    uint base_rows = 0u, base_ent = 0u, tot_ent = 0u;
+    for (uint i = 0; i < gl_NumSubgroups; i++) {
+        if (i < gl_SubgroupID) { base_rows += sg_rows[i]; base_ent += sg_ent[i]; }
+        tot_ent += sg_ent[i];
+    }
+    uint o = base_rows + ex_rows, eo = base_ent + ex_ent;
+    for (uint e = e0; e < min(E, e0 + per); e++) {
+        off[e] = o;
+        eoff[e] = eo;
+        o += cnt[e];
+        eo += (cnt[e] + pc.chunk - 1u) / pc.chunk;
+    }
+    if (tid == 0u) {
+        U32W a = U32W(pc.args);
+        a.v[0] = pc.gx_up; a.v[1] = tot_ent; a.v[2] = 1u;
+        a.v[3] = pc.gx_down; a.v[4] = tot_ent; a.v[5] = 1u;
+    }
+    barrier();
+    U32W toks = U32W(pc.toks), comb = U32W(pc.comb);
+    F32 selw = F32(pc.selw);
+    Entries ent = Entries(pc.entries);
+    Locs loc = Locs(pc.loc);
+    // place each selection at its expert's next free row (order within an expert does not matter:
+    // every row is computed independently and moe_combine follows comb[] back to it)
+    for (uint e = tid; e < E; e += 256u) fill[e] = 0u;
+    barrier();
+    for (uint i = tid; i < pc.n_sel; i += 256u) {
+        const uint e = sel.v[i];
+        const uint r = off[e] + atomicAdd(fill[e], 1u);
+        toks.v[r] = i / pc.top_k;
+        comb.v[2u * i] = r;
+        comb.v[2u * i + 1u] = floatBitsToUint(selw.v[i]);
+    }
+    for (uint e = tid; e < E; e += 256u) {
+        const uint c = cnt[e];
+        if (c == 0u) continue;
+        const uint64_t base = loc.v[e];
+        for (uint k = 0; k * pc.chunk < c; k++) {
+            Entry en;
+            en.base = base;
+            en.start = off[e] + k * pc.chunk;
+            en.count = min(pc.chunk, c - k * pc.chunk);
+            ent.e[eoff[e] + k] = en;
+        }
+    }
+}

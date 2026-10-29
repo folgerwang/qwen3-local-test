@@ -1,0 +1,7 @@
+# Model weights are fetched by setup.py, never committed
+models/
+build/
+*.log
+# 867 MB reference tensor, regenerate with tests/ref_logits.py
+tests/ref_last_logits.pt
+__pycache__/

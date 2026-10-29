@@ -1,0 +1,25 @@
+// Per (token, head): o = rmsnorm(o) * w * silu(z), in place. 128 threads = head dim.
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 128) in;
+layout(push_constant) uniform PC {
+    uint64_t o, z, w;
+    uint n_heads;
+    float eps;
+} pc;
+
+shared float red[4];
+
+void main() {
+    const uint t = gl_WorkGroupID.x, h = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+    const uint idx = (t * pc.n_heads + h) * 128u + tid;
+    F32 o = F32(pc.o);
+    const float v = o.v[idx];
+    const float ss = subgroupAdd(v * v);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = ss;
+    barrier();
+    float tot = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; i++) tot += red[i];
+    o.v[idx] = v * inversesqrt(tot / 128.0 + pc.eps) * F32(pc.w).v[tid] * silu(F32(pc.z).v[idx]);
+}

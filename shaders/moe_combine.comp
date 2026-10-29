@@ -1,0 +1,22 @@
+// x[t] += sigmoid(sgate[t]) * shared_y[t] + sum_k weight[t,k] * expert_y[row[t,k]]
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t x, sgate, sy, ey, table;  // table: [n][top_k] of (row uint, weight float)
+    uint dim, top_k;
+} pc;
+
+void main() {
+    const uint d = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
+    if (d >= pc.dim) return;
+    F32 x = F32(pc.x), sy = F32(pc.sy), ey = F32(pc.ey);
+    U32 tb = U32(pc.table);
+    float acc = sigmoid(F32(pc.sgate).v[t]) * sy.v[t * pc.dim + d];
+    for (uint k = 0; k < pc.top_k; k++) {
+        const uint e = (t * pc.top_k + k) * 2u;
+        acc += uintBitsToFloat(tb.v[e + 1u]) * ey.v[tb.v[e] * pc.dim + d];
+    }
+    x.v[t * pc.dim + d] += acc;
+}

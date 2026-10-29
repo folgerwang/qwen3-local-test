@@ -1,0 +1,29 @@
+// Merges split-K attention partials for one (token, head) and applies the sigmoid output gate.
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+#define D 256
+#define PART (D + 2)
+layout(push_constant) uniform PC {
+    uint64_t part, qg, out_;
+    uint n_heads, n_split;
+} pc;
+
+void main() {
+    const uint t = gl_WorkGroupID.x, h = gl_WorkGroupID.y, d = gl_LocalInvocationID.x;
+    F32 part = F32(pc.part + uint64_t((t * pc.n_heads + h) * pc.n_split * PART) * 4u);
+    float M = -1e30;
+    for (uint z = 0; z < pc.n_split; z++)
+        if (part.v[z * PART + 1u] > 0.0) M = max(M, part.v[z * PART]);
+    float L = 0.0, o = 0.0;
+    for (uint z = 0; z < pc.n_split; z++) {
+        const float l = part.v[z * PART + 1u];
+        if (l <= 0.0) continue;
+        const float c = exp(part.v[z * PART] - M);
+        L += l * c;
+        o += part.v[z * PART + 2u + d] * c;
+    }
+    const float gate = F32(pc.qg).v[(t * pc.n_heads + h) * 2u * D + D + d];
+    F32(pc.out_).v[(t * pc.n_heads + h) * D + d] = (o / L) * sigmoid(gate);
+}

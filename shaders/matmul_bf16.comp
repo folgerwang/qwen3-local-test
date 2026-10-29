@@ -1,0 +1,36 @@
+// Y[t, row] = sum_c W[row, c] * X[t, c] for BF16 W. Same layout as matmul_fp8 (cols multiple of 256).
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+#define NT 8
+
+layout(push_constant) uniform PC {
+    uint64_t w, x, y;
+    uint rows, cols, n, x_stride, y_stride;
+} pc;
+
+void main() {
+    const uint team = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    const uint row = gl_WorkGroupID.x * 8u + team;
+    if (row >= pc.rows) return;
+    const uint chunks = pc.cols / 8u;
+    const uint t0 = gl_WorkGroupID.y * NT;
+    const uint nt = min(NT, pc.n - t0);
+    float acc[NT];
+    for (uint t = 0; t < NT; t++) acc[t] = 0.0;
+    for (uint c = lane; c < chunks; c += 32u) {
+        const uvec4 wv = U4(pc.w).v[row * chunks + c];
+        const vec4 a0 = bf16x2x2(wv.xy), a1 = bf16x2x2(wv.zw);
+        [[unroll]] for (uint t = 0; t < NT; t++) {
+            if (t >= nt) break;
+            F4 xs = F4(pc.x + uint64_t(t0 + t) * pc.x_stride * 4u);
+            acc[t] += dot(a0, xs.v[c * 2u]) + dot(a1, xs.v[c * 2u + 1u]);
+        }
+    }
+    [[unroll]] for (uint t = 0; t < NT; t++) {
+        if (t >= nt) break;
+        const float r = subgroupAdd(acc[t]);
+        if (lane == 0u) F32(pc.y + uint64_t(t0 + t) * pc.y_stride * 4u).v[row] = r;
+    }
+}

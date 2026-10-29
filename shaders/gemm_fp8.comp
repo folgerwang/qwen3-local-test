@@ -1,0 +1,101 @@
+// Tiled GEMM for many tokens: Y[t, r] = sum_c W[r, c] * X[t, c], W FP8 with 128x128 block scales.
+// Workgroup tile = 64 rows x 64 tokens, K step 32; W is dequantized into shared memory once per tile and
+// each of the 256 threads accumulates a 4x4 block. Variants: SWIGLU (silu(W1 x) * (W2 x)), EXPERT
+// (grouped expert rows, same entry format as matmul_fp8 EXPERT with up to 64 rows per entry).
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+#define BM 64
+#define BN 64
+#define BK 32
+
+#ifdef EXPERT
+struct Entry { uint64_t base; uint start, count; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Table { Entry e[]; };
+layout(push_constant) uniform PC {
+    uint64_t table, toks, x, y;
+    uint woff1, soff1, woff2, soff2, rows, cols, x_stride, y_stride, x_mode;
+} pc;
+#else
+layout(push_constant) uniform PC {
+    uint64_t w1, s1, w2, s2, x, y;
+    uint rows, cols, n, x_stride, y_stride;
+} pc;
+#endif
+
+shared vec4 Ws[BK][BM / 4];
+#ifdef SWIGLU
+shared vec4 Ws2[BK][BM / 4];
+#endif
+shared vec4 Xs[BK][BN / 4];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, ty = tid / 16u, tx = tid % 16u;
+    const uint r0 = gl_WorkGroupID.x * BM;
+    const uint cols = pc.cols, nblk = cols / 128u;
+#ifdef EXPERT
+    const Entry en = Table(pc.table).e[gl_WorkGroupID.y];
+    const uint ntok = en.count, out0 = en.start;
+    const uint64_t w1 = en.base + pc.woff1, s1 = en.base + pc.soff1, w2 = en.base + pc.woff2, s2 = en.base + pc.soff2;
+#else
+    const uint t0 = gl_WorkGroupID.y * BN;
+    const uint ntok = min(BN, pc.n - t0), out0 = t0;
+    const uint64_t w1 = pc.w1, s1 = pc.s1, w2 = pc.w2, s2 = pc.s2;
+#endif
+    // loader roles: weight row / token = tid / 4, 8-wide k segment = tid % 4
+    const uint lr = tid / 4u, lk = (tid % 4u) * 8u;
+    const bool tok_ok = lr < ntok;
+#ifdef EXPERT
+    const uint xrow = tok_ok ? (pc.x_mode == 0u ? U32(pc.toks).v[en.start + lr] : en.start + lr) : 0u;
+#else
+    const uint xrow = t0 + lr;
+#endif
+    const uint wrow = r0 + lr;
+    F4 xs = F4(pc.x + uint64_t(xrow) * pc.x_stride * 4u);
+
+    vec4 acc[4], acc2[4];
+    [[unroll]] for (uint i = 0; i < 4u; i++) { acc[i] = vec4(0.0); acc2[i] = vec4(0.0); }
+    // acc[i][j]: row ty*4+i, token tx*4+j
+
+    for (uint k0 = 0; k0 < cols; k0 += BK) {
+        {
+            const uint widx = (wrow * cols + k0 + lk) / 8u;
+            const float sc = bf16_at(s1, (wrow / 128u) * nblk + k0 / 128u) * 256.0;
+            const uvec2 wv = U2(w1).v[widx];
+            const vec4 a = fp8x4(wv.x) * sc, b = fp8x4(wv.y) * sc;
+            [[unroll]] for (uint j = 0; j < 4u; j++) { Ws[lk + j][lr / 4u][lr % 4u] = a[j]; Ws[lk + 4u + j][lr / 4u][lr % 4u] = b[j]; }
+#ifdef SWIGLU
+            const float sc2 = bf16_at(s2, (wrow / 128u) * nblk + k0 / 128u) * 256.0;
+            const uvec2 wv2 = U2(w2).v[widx];
+            const vec4 a2 = fp8x4(wv2.x) * sc2, b2 = fp8x4(wv2.y) * sc2;
+            [[unroll]] for (uint j = 0; j < 4u; j++) { Ws2[lk + j][lr / 4u][lr % 4u] = a2[j]; Ws2[lk + 4u + j][lr / 4u][lr % 4u] = b2[j]; }
+#endif
+            vec4 x0 = vec4(0.0), x1 = vec4(0.0);
+            if (tok_ok) { x0 = xs.v[(k0 + lk) / 4u]; x1 = xs.v[(k0 + lk) / 4u + 1u]; }
+            [[unroll]] for (uint j = 0; j < 4u; j++) { Xs[lk + j][lr / 4u][lr % 4u] = x0[j]; Xs[lk + 4u + j][lr / 4u][lr % 4u] = x1[j]; }
+        }
+        barrier();
+        [[unroll]] for (uint k = 0; k < BK; k++) {
+            const vec4 a = Ws[k][ty], b = Xs[k][tx];
+            acc[0] += a.x * b; acc[1] += a.y * b; acc[2] += a.z * b; acc[3] += a.w * b;
+#ifdef SWIGLU
+            const vec4 a2 = Ws2[k][ty];
+            acc2[0] += a2.x * b; acc2[1] += a2.y * b; acc2[2] += a2.z * b; acc2[3] += a2.w * b;
+#endif
+        }
+        barrier();
+    }
+    [[unroll]] for (uint j = 0; j < 4u; j++) {
+        const uint tok = tx * 4u + j;
+        if (tok >= ntok) break;
+        F32 y = F32(pc.y + uint64_t(out0 + tok) * pc.y_stride * 4u);
+        [[unroll]] for (uint i = 0; i < 4u; i++) {
+#ifdef SWIGLU
+            y.v[r0 + ty * 4u + i] = silu(acc[i][j]) * acc2[i][j];
+#else
+            y.v[r0 + ty * 4u + i] = acc[i][j];
+#endif
+        }
+    }
+}

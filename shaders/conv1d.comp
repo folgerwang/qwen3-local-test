@@ -1,0 +1,30 @@
+// Causal depthwise conv1d (kernel K) + SiLU over n tokens, in place. One thread per channel.
+// state holds the previous K-1 inputs per channel, oldest first: state[k * channels + ch].
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+#define K 4
+layout(push_constant) uniform PC {
+    uint64_t data, w, state;
+    uint n, channels;
+} pc;
+
+void main() {
+    const uint ch = gl_GlobalInvocationID.x;
+    if (ch >= pc.channels) return;
+    F32 d = F32(pc.data), st = F32(pc.state), w = F32(pc.w);
+    float wk[K], hist[K - 1];
+    [[unroll]] for (uint k = 0; k < K; k++) wk[k] = w.v[ch * K + k];
+    [[unroll]] for (uint k = 0; k < K - 1; k++) hist[k] = st.v[k * pc.channels + ch];
+    for (uint t = 0; t < pc.n; t++) {
+        const uint idx = t * pc.channels + ch;
+        const float in_ = d.v[idx];
+        float acc = wk[K - 1] * in_;
+        [[unroll]] for (uint k = 0; k < K - 1; k++) acc += wk[k] * hist[k];
+        [[unroll]] for (uint k = 0; k < K - 2; k++) hist[k] = hist[k + 1];
+        hist[K - 2] = in_;
+        d.v[idx] = silu(acc);
+    }
+    [[unroll]] for (uint k = 0; k < K - 1; k++) st.v[k * pc.channels + ch] = hist[k];
+}
