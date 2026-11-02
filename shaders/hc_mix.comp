@@ -1,0 +1,19 @@
+// qwen4 hyper-connection block input: out[t, j] = mean_s sigmoid(u[t, s*dim + j]) * hn[t, s*dim + j].
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t u, hn, out_;
+    uint dim, streams;
+} pc;
+
+void main() {
+    const uint j = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
+    if (j >= pc.dim) return;
+    const uint base = t * pc.dim * pc.streams + j;
+    F32 u = F32(pc.u), hn = F32(pc.hn);
+    float acc = 0.0;
+    for (uint s = 0; s < pc.streams; s++) acc += sigmoid(u.v[base + s * pc.dim]) * hn.v[base + s * pc.dim];
+    F32(pc.out_).v[t * pc.dim + j] = acc / float(pc.streams);
+}

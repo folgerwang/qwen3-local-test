@@ -1,0 +1,41 @@
+// qwen4 indexer projections, per (token t, head h) with 128 threads = head dim D:
+//   h < n_heads: q = rope(rmsnorm(q) * (1 + qn)) -> iq[t, h]
+//   h == n_heads: raw key (no norm) -> kraw[pos + t]
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 128) in;
+#define D 128
+layout(push_constant) uniform PC {
+    uint64_t qk, iq, kraw, qn, rope;
+    uint pos, n_heads, rope_dim;
+    float eps;
+} pc;
+
+shared float sh[D];
+shared float red[4];
+
+void main() {
+    const uint t = gl_WorkGroupID.x, h = gl_WorkGroupID.y, d = gl_LocalInvocationID.x;
+    const float x = F32(pc.qk).v[(t * (pc.n_heads + 1u) + h) * D + d];
+    if (h == pc.n_heads) {
+        F32(pc.kraw).v[(pc.pos + t) * D + d] = x;
+        return;
+    }
+    const float ss = subgroupAdd(x * x);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = ss;
+    barrier();
+    float tot = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; i++) tot += red[i];
+    float y = x * inversesqrt(tot / float(D) + pc.eps) * (1.0 + F32(pc.qn).v[d]);
+    sh[d] = y;
+    barrier();
+    const uint half_ = pc.rope_dim / 2u;
+    if (d < pc.rope_dim) {
+        const uint i = d % half_;
+        F32 rp = F32(pc.rope + uint64_t(pc.pos + t) * pc.rope_dim * 4u);
+        const float c = rp.v[2u * i], s = rp.v[2u * i + 1u];
+        y = d < half_ ? sh[d] * c - sh[d + half_] * s : sh[d] * c + sh[i] * s;
+    }
+    F32(pc.iq).v[(t * pc.n_heads + h) * D + d] = y;
+}

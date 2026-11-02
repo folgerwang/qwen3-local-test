@@ -1,9 +1,18 @@
 # Runs qwen.exe --eval for each backend / prompt / split and compares top-10 logits to the fp32 reference.
+# usage: python tests/check.py [cpu,vulkan] [35b|flash]
 import os, subprocess, sys
 exe = os.path.abspath("build/Release/qwen.exe")
 backends = sys.argv[1].split(",") if len(sys.argv) > 1 else ["cpu", "vulkan"]
-cases = [("short", "tests/eval_ids.txt", "tests/ref_short_top10.txt", [0, 5]),
-         ("long", "tests/eval_long_ids.txt", "tests/ref_long_top10.txt", [0, 3])]
+model = sys.argv[2] if len(sys.argv) > 2 else "35b"
+if model == "flash":
+    # the long prompt (3000 tokens) is past the indexer budget, so it exercises the sparse attention selection
+    extra = ["--model", "models/Qwen3.8-Flash-Next-FP8", "--ctx", "4096"]
+    cases = [("short", "tests/eval_ids.txt", "tests/ref_flash_short_top10.txt", [0, 5]),
+             ("long", "tests/eval_flash_long_ids.txt", "tests/ref_flash_long_top10.txt", [0, 3])]
+else:
+    extra = ["--ctx", "2048"]
+    cases = [("short", "tests/eval_ids.txt", "tests/ref_short_top10.txt", [0, 5]),
+             ("long", "tests/eval_long_ids.txt", "tests/ref_long_top10.txt", [0, 3])]
 ok = True
 for be in backends:
     for name, ids_f, ref_f, splits in cases:
@@ -11,7 +20,7 @@ for be in backends:
         ref = [(int(a), float(b)) for a, b in (l.split() for l in open(ref_f) if l.strip())]
         ids = open(ids_f).read().strip()
         for sp in splits:
-            r = subprocess.run([exe, "--backend", be, "--eval", ids, "--eval-split", str(sp), "--ctx", "2048"],
+            r = subprocess.run([exe, "--backend", be, "--eval", ids, "--eval-split", str(sp)] + extra,
                                capture_output=True, text=True)
             got = [(int(a), float(b)) for a, b in (l.split() for l in r.stdout.splitlines() if l.strip())]
             if len(got) != 10:

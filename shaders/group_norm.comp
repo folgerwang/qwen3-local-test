@@ -1,0 +1,30 @@
+// Grouped RMSNorm with (1 + w): row t holds `groups` slices of `dim` values, each normalized on its own with
+// its own weight slice (w[g * dim ..]). One workgroup per (row, group). Used for the qwen4 hyper-connection
+// streams and the PLE norms.
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t x, w, out_;
+    uint x_stride, out_stride, dim;
+    float eps;
+} pc;
+
+shared float red[8];
+
+void main() {
+    const uint t = gl_WorkGroupID.x, g = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+    F32 x = F32(pc.x + (uint64_t(t) * pc.x_stride + g * pc.dim) * 4u);
+    float ss = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256u) { const float v = x.v[i]; ss += v * v; }
+    ss = subgroupAdd(ss);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = ss;
+    barrier();
+    float tot = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; i++) tot += red[i];
+    const float r = inversesqrt(tot / float(pc.dim) + pc.eps);
+    F32 o = F32(pc.out_ + (uint64_t(t) * pc.out_stride + g * pc.dim) * 4u);
+    F32 w = F32(pc.w + uint64_t(g) * pc.dim * 4u);
+    for (uint i = tid; i < pc.dim; i += 256u) o.v[i] = x.v[i] * r * (1.0 + w.v[i]);
+}

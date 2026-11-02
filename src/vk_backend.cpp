@@ -559,14 +559,25 @@ struct PcMatBf16 { uint64_t w, x, y; uint32_t rows, cols, n, x_stride, y_stride;
 struct PcNorm { uint64_t x, delta, w, out; uint32_t dim; float eps; };
 struct PcConv { uint64_t data, w, state; uint32_t n, channels; };
 struct PcDelta { uint64_t qkv, a, b, neg_a, dt_bias, state, out; uint32_t n, conv_dim, key_dim, n_v_heads, ratio; };
-struct PcGatedNorm { uint64_t o, z, w; uint32_t n_heads; float eps; };
+struct PcGatedNorm { uint64_t o, z, w; uint32_t n_heads; float eps; uint32_t sigm; };
 struct PcQkRope { uint64_t qg, k, v, q_out, kcache, vcache, qn, kn, rope; uint32_t pos, n_heads, n_kv, rope_dim; float eps; };
-struct PcAttn { uint64_t q, kcache, vcache, part; uint32_t pos, n_heads, n_kv, chunk, n_split; float scale; };
+struct PcAttn { uint64_t q, kcache, vcache, part, sel; uint32_t pos, n_heads, n_kv, chunk, n_split; float scale; uint32_t ratio, topb; };
 struct PcAttnCombine { uint64_t part, qg, out; uint32_t n_heads, n_split; };
 struct PcRoute { uint64_t logits, sel, selw; uint32_t n_experts, top_k; };
 struct PcGroup { uint64_t sel, selw, loc, entries, toks, comb, args; uint32_t n_sel, top_k, n_experts, chunk, gx_up, gx_down; };
-struct PcCombine { uint64_t x, sgate, sy, ey, table; uint32_t dim, top_k; };
+struct PcCombine { uint64_t x, sgate, sy, ey, table; uint32_t dim, top_k, accumulate; };
 struct PcCombW { uint64_t comb, selw; uint32_t n; };
+// qwen4
+struct PcGroupNorm { uint64_t x, w, out; uint32_t x_stride, out_stride, dim; float eps; };
+struct PcHcMix { uint64_t u, hn, out; uint32_t dim, streams; };
+struct PcHcOut { uint64_t x, y, inj; uint32_t dim, streams; };
+struct PcEw { uint64_t a, b; uint32_t n, mode; float scale; };
+struct PcPleGate { uint64_t kn, qn, val, gv; uint32_t dim, streams; };
+struct PcPleConv { uint64_t gv, gvn, x, w, state; uint32_t n, channels; };
+struct PcIdxPrep { uint64_t qk, iq, kraw, qn, rope; uint32_t pos, n_heads, rope_dim; float eps; };
+struct PcIdxPool { uint64_t kraw, kblk, kn, rope; uint32_t b0, ratio, rope_dim; float eps; };
+struct PcIdxScore { uint64_t iq, kblk, scores; uint32_t pos, ratio, n_heads, stride; };
+struct PcIdxSel { uint64_t scores, sel; uint32_t pos, ratio, topb, stride; };
 
 struct ExpertEntry { uint64_t base; uint32_t start, count; };  // matches `Entry` in the expert shaders
 static_assert(sizeof(ExpertEntry) == 16, "ExpertEntry layout");
@@ -575,11 +586,19 @@ static_assert(sizeof(ExpertEntry) == 16, "ExpertEntry layout");
 struct GQ { Ptr w, s; int rows = 0, cols = 0; };
 struct GB { Ptr w; int rows = 0, cols = 0; };
 
+// Dense projection on the GPU: FP8 (q.rows != 0) or BF16.
+struct GL { GQ q; GB b; };
+
+// qwen4 hyper-connection weights (inject.rows == 0 for the final mixer)
+struct GHc { Ptr norm; GB down, up, inject; };
+
 struct GLayer {
     Ptr in_norm, post_norm;                 // f32
-    GQ q, k, v, o; Ptr qn, kn;              // attention
-    GQ qkv, z, out; GB a, b; Ptr conv, neg_a, dt_bias, lnorm;  // deltanet
-    GB router, sgate; GQ sh_gate, sh_up, sh_down;
+    GL q, k, v, o; Ptr qn, kn;              // attention
+    GL qkv, z, out; GB a, b; Ptr conv, neg_a, dt_bias, lnorm;  // deltanet
+    GB router, sgate; GL sh_gate, sh_up, sh_down;
+    GHc attn_hc, mlp_hc;                    // qwen4
+    GB idx_qk; Ptr idx_qn, idx_kn;          // qwen4 indexer
 };
 
 uint32_t groups(uint32_t n, uint32_t per) { return (n + per - 1) / per; }
@@ -607,7 +626,9 @@ public:
         gpu_.begin();
         gpu_.fill_zero(conv_state_);
         gpu_.fill_zero(rec_state_);
+        if (ple_state_) gpu_.fill_zero(ple_state_);
         gpu_.submit_wait();
+        hist_.assign(std::max(c_.ngram - 1, 0), c_.ple_eos);
     }
     int pos() const override { return pos_; }
     int max_ctx() const override { return max_ctx_; }
@@ -617,15 +638,19 @@ public:
         gpu_.begin();
         gpu_.copy(conv_state_, 0, conv_saved_, 0, conv_state_->size);
         gpu_.copy(rec_state_, 0, rec_saved_, 0, rec_state_->size);
+        if (ple_state_) gpu_.copy(ple_state_, 0, ple_saved_, 0, ple_state_->size);
         gpu_.submit_wait();
         saved_pos_ = pos_;
+        saved_hist_ = hist_;
     }
     void restore_state() override {
         gpu_.begin();
         gpu_.copy(conv_saved_, 0, conv_state_, 0, conv_state_->size);
         gpu_.copy(rec_saved_, 0, rec_state_, 0, rec_state_->size);
+        if (ple_state_) gpu_.copy(ple_saved_, 0, ple_state_, 0, ple_state_->size);
         gpu_.submit_wait();
         pos_ = saved_pos_;
+        hist_ = saved_hist_;
     }
 
     void forward(const int* tokens, int n, float* logits) override {
@@ -665,6 +690,19 @@ private:
     Buf* hx_ = nullptr;     // embeddings of the current chunk
     Buf* hsel_ = nullptr;   // selected expert ids, [layer][NMAX * top_k]
     Buf* hlog_ = nullptr;   // final logits
+    // qwen4: x_ holds hc streams [n, hc * hidden]; xn_ the mixed block input; mix_ the block output
+    int HH_ = 0;
+    GHc mixer_;
+    GB ple_key_, ple_val_; Ptr ple_nk_, ple_nq_, ple_nc_, ple_conv_;
+    Ptr hn_, hd_, hu_, inj_, su_, emb_, pk_, pv_, iqk_, iq_, scores_, isel_;
+    Buf* hemb_ = nullptr;       // PLE n-gram embeddings computed on the CPU
+    Buf* ple_state_ = nullptr;  // dilated conv history [(K-1)*dil][hc*hidden]
+    Buf* ple_saved_ = nullptr;
+    Buf* kraw_ = nullptr;       // indexer raw keys [full layer][pos][idx_dim]
+    Buf* kblk_ = nullptr;       // indexer pooled block keys [full layer][block][idx_dim]
+    int nblk_ = 0;              // blocks per layer in kblk_
+    std::vector<int> hist_, saved_hist_;
+    std::unique_ptr<ThreadPool> ple_pool_;  // CPU threads for the PLE lookups
 
     // experts
     struct Slot { Buf* buf = nullptr; VkDeviceSize off = 0; int key = -1; uint64_t tick = 0; };
@@ -710,6 +748,20 @@ private:
         up_.put(p, v.data(), v.size() * 4);
         return p;
     }
+    GL up_lin(const Lin& m) {
+        GL g;
+        if (m.fp8()) g.q = up_q(m.q);
+        else g.b = up_b(m.b);
+        return g;
+    }
+    GHc up_hc(const HyperConn& h) {
+        GHc g;
+        g.norm = up_f32(to_f32(h.norm));
+        g.down = up_b(h.down);
+        g.up = up_b(h.up);
+        if (h.inject.rows) g.inject = up_b(h.inject);
+        return g;
+    }
     static std::vector<float> to_f32(const BMat& m) {
         std::vector<float> v((size_t)m.rows * m.cols);
         for (size_t i = 0; i < v.size(); i++) v[i] = m.at(i);
@@ -718,21 +770,44 @@ private:
 
     void upload_weights() {
         lm_head_ = up_b(w_.lm_head);
-        final_norm_ = up_f32(to_f32(w_.final_norm));
+        if (c_.qwen4) {
+            mixer_ = up_hc(w_.mixer);
+            if (c_.ple_layer >= 0) {
+                const Ple& P = w_.ple;
+                ple_key_ = up_b(P.key_proj);
+                ple_val_ = up_b(P.value_proj);
+                ple_nk_ = up_f32(to_f32(P.norm_key));
+                ple_nq_ = up_f32(to_f32(P.norm_query));
+                ple_nc_ = up_f32(to_f32(P.norm_conv));
+                ple_conv_ = up_f32(to_f32(P.conv));
+            }
+        } else {
+            final_norm_ = up_f32(to_f32(w_.final_norm));
+        }
         int nf = 0, nl = 0;
         for (int l = 0; l < c_.n_layers; l++) {
             const LayerWeights& W = w_.layers[l];
             GLayer g;
-            g.in_norm = up_f32(to_f32(W.input_norm));
-            g.post_norm = up_f32(to_f32(W.post_norm));
+            if (c_.qwen4) {
+                g.attn_hc = up_hc(W.attn_hc);
+                g.mlp_hc = up_hc(W.mlp_hc);
+            } else {
+                g.in_norm = up_f32(to_f32(W.input_norm));
+                g.post_norm = up_f32(to_f32(W.post_norm));
+            }
             if (W.full_attn) {
                 slot_.push_back(nf++);
-                g.q = up_q(W.q_proj); g.k = up_q(W.k_proj); g.v = up_q(W.v_proj); g.o = up_q(W.o_proj);
+                g.q = up_lin(W.q_proj); g.k = up_lin(W.k_proj); g.v = up_lin(W.v_proj); g.o = up_lin(W.o_proj);
                 g.qn = up_f32(to_f32(W.q_norm));
                 g.kn = up_f32(to_f32(W.k_norm));
+                if (c_.qwen4) {
+                    g.idx_qk = up_b(W.idx_qk);
+                    g.idx_qn = up_f32(to_f32(W.idx_qn));
+                    g.idx_kn = up_f32(to_f32(W.idx_kn));
+                }
             } else {
                 slot_.push_back(nl++);
-                g.qkv = up_q(W.in_qkv); g.z = up_q(W.in_z); g.out = up_q(W.out_proj);
+                g.qkv = up_lin(W.in_qkv); g.z = up_lin(W.in_z); g.out = up_lin(W.out_proj);
                 g.a = up_b(W.in_a); g.b = up_b(W.in_b);
                 g.conv = up_f32(to_f32(W.conv1d));
                 std::vector<float> na = to_f32(W.a_log);
@@ -743,7 +818,7 @@ private:
             }
             g.router = up_b(W.router);
             g.sgate = up_b(W.shared_gate);
-            g.sh_gate = up_q(W.shared.gate); g.sh_up = up_q(W.shared.up); g.sh_down = up_q(W.shared.down);
+            g.sh_gate = up_lin(W.sh_gate); g.sh_up = up_lin(W.sh_up); g.sh_down = up_lin(W.sh_down);
             L_.push_back(g);
         }
         // rope table [max_ctx][rope_dim/2] of (cos, sin), computed like the CPU path
@@ -765,7 +840,8 @@ private:
         const int n_full = (int)std::count(c_.is_full_attn.begin(), c_.is_full_attn.end(), true);
         const int n_lin = c_.n_layers - n_full;
         auto act = [&](size_t floats) { return arena_.alloc(floats * 4); };
-        x_ = act((size_t)NMAX * H);
+        HH_ = c_.hc * H;
+        x_ = act((size_t)NMAX * HH_);
         xn_ = act((size_t)NMAX * H);
         mix_ = act((size_t)NMAX * H);
         qkv_ = act((size_t)NMAX * c_.conv_dim());
@@ -801,7 +877,32 @@ private:
         rec_state_ = gpu_.create(rs, Mem::Device);
         conv_saved_ = gpu_.create(cs, Mem::Device);
         rec_saved_ = gpu_.create(rs, Mem::Device);
-        hx_ = gpu_.create((VkDeviceSize)NMAX * H * 4, Mem::HostUpload);
+        hx_ = gpu_.create((VkDeviceSize)NMAX * HH_ * 4, Mem::HostUpload);
+        if (c_.qwen4) {
+            hn_ = act((size_t)NMAX * HH_);
+            hu_ = act((size_t)NMAX * HH_);
+            hd_ = act((size_t)NMAX * c_.hc_rank);
+            inj_ = act((size_t)NMAX * c_.hc);
+            su_ = act((size_t)NMAX * c_.shared_inter);
+            if (c_.ple_layer >= 0) {
+                emb_ = act((size_t)NMAX * c_.ple_dim);
+                pk_ = act((size_t)NMAX * HH_);
+                pv_ = act((size_t)NMAX * H);
+                hemb_ = gpu_.create((VkDeviceSize)NMAX * c_.ple_dim * 4, Mem::HostUpload);
+                const VkDeviceSize ps = (VkDeviceSize)(c_.ple_conv - 1) * c_.ngram * HH_ * 4;
+                ple_state_ = gpu_.create(ps, Mem::Device);
+                ple_saved_ = gpu_.create(ps, Mem::Device);
+                ple_pool_ = std::make_unique<ThreadPool>(0);
+            }
+            const int D = c_.idx_dim;
+            nblk_ = max_ctx_ / c_.idx_ratio + 1;
+            iqk_ = act((size_t)NMAX * (c_.idx_heads + 1) * D);
+            iq_ = act((size_t)NMAX * c_.idx_heads * D);
+            scores_ = act((size_t)NMAX * nblk_);
+            isel_ = arena_.alloc((VkDeviceSize)NMAX * (c_.idx_budget / c_.idx_ratio + 1) * 4);
+            kraw_ = gpu_.create(std::max<VkDeviceSize>((VkDeviceSize)n_full * max_ctx_ * D * 4, 256), Mem::Device);
+            kblk_ = gpu_.create(std::max<VkDeviceSize>((VkDeviceSize)n_full * nblk_ * D * 4, 256), Mem::Device);
+        }
         hsel_ = gpu_.create((VkDeviceSize)c_.n_layers * NMAX * TK * 4, Mem::HostRead);
         hlog_ = gpu_.create((VkDeviceSize)c_.vocab * 4, Mem::HostRead);
     }
@@ -1050,6 +1151,89 @@ private:
         PcMatBf16 pc{m.w.addr(), x, y, (uint32_t)m.rows, (uint32_t)m.cols, (uint32_t)n, (uint32_t)x_stride, (uint32_t)m.rows};
         gpu_.dispatch("matmul_bf16", pc, groups(m.rows, 8), groups(n, NT), 1, label);
     }
+    // y = x W^T for an FP8 or BF16 projection (x rows are cols wide)
+    void lin(const GL& m, Ptr x, Ptr y, int n) {
+        if (m.q.rows) mat_q(m.q, x, y, n);
+        else mat_b(m.b, x.addr(), y.addr(), n, m.b.cols);
+    }
+    void ew(Ptr a, Ptr b, uint32_t count, uint32_t mode, float scale) {
+        PcEw pc{a.addr(), b.addr(), count, mode, scale};
+        gpu_.dispatch("elementwise", pc, groups(count, 256));
+    }
+    void group_norm(Ptr x, uint32_t x_stride, Ptr w, Ptr out, uint32_t out_stride, int n) {
+        PcGroupNorm pc{x.addr(), w.addr(), out.addr(), x_stride, out_stride, (uint32_t)c_.hidden, c_.rms_eps};
+        gpu_.dispatch("group_norm", pc, n, c_.hc);
+    }
+
+    // qwen4 hyper-connection input: normalize the streams of x, mix them into xn_, inject logits -> inj_.
+    void hc_in(const GHc& h, Ptr x, int n) {
+        const int S = c_.hc;
+        group_norm(x, HH_, h.norm, hn_, HH_, n);
+        gpu_.barrier();
+        mat_b(h.down, hn_.addr(), hd_.addr(), n, HH_);
+        if (h.inject.rows) mat_b(h.inject, hn_.addr(), inj_.addr(), n, HH_);
+        gpu_.barrier();
+        ew(hd_, hd_, (uint32_t)(n * c_.hc_rank), 0, 1.0f / S);
+        gpu_.barrier();
+        mat_b(h.up, hd_.addr(), hu_.addr(), n, c_.hc_rank);
+        gpu_.barrier();
+        PcHcMix pm{hu_.addr(), hn_.addr(), xn_.addr(), (uint32_t)c_.hidden, (uint32_t)S};
+        gpu_.dispatch("hc_mix", pm, groups(c_.hidden, 256), n);
+        gpu_.barrier();
+    }
+    // streams += block output (mix_) * injection weights
+    void hc_out(int n) {
+        PcHcOut po{x_.addr(), mix_.addr(), inj_.addr(), (uint32_t)c_.hidden, (uint32_t)c_.hc};
+        gpu_.dispatch("hc_out", po, groups(c_.hidden, 256), n);
+        gpu_.barrier();
+    }
+    // qwen4 PLE: n-gram embeddings (uploaded in emb_) gated into every stream, plus the dilated conv.
+    void ple(int n) {
+        const int H = c_.hidden, S = c_.hc;
+        mat_b(ple_key_, emb_.addr(), pk_.addr(), n, c_.ple_dim);
+        mat_b(ple_val_, emb_.addr(), pv_.addr(), n, c_.ple_dim);
+        group_norm(x_, HH_, ple_nq_, hn_, HH_, n);
+        gpu_.barrier();
+        group_norm(pk_, HH_, ple_nk_, pk_, HH_, n);
+        gpu_.barrier();
+        PcPleGate pg{pk_.addr(), hn_.addr(), pv_.addr(), hu_.addr(), (uint32_t)H, (uint32_t)S};
+        gpu_.dispatch("ple_gate", pg, n, S);
+        gpu_.barrier();
+        group_norm(hu_, HH_, ple_nc_, pk_, HH_, n);
+        gpu_.barrier();
+        PcPleConv pc{hu_.addr(), pk_.addr(), x_.addr(), ple_conv_.addr(), ple_state_->addr, (uint32_t)n, (uint32_t)HH_};
+        gpu_.dispatch("ple_conv", pc, groups(HH_, 256));
+        gpu_.barrier();
+    }
+    // qwen4 indexer: queries / raw keys, pooled keys of completed blocks, and (past the budget) the top-k
+    // block selection per token. Returns the selection buffer address, or 0 when every position is attended.
+    uint64_t indexer(int l, int n) {
+        const GLayer& g = L_[l];
+        const int D = c_.idx_dim, R = c_.idx_ratio, TOPB = c_.idx_budget / R;
+        const uint64_t kr = kraw_->addr + (uint64_t)slot_[l] * max_ctx_ * D * 4;
+        const uint64_t kb = kblk_->addr + (uint64_t)slot_[l] * nblk_ * D * 4;
+        mat_b(g.idx_qk, xn_.addr(), iqk_.addr(), n, c_.hidden);
+        gpu_.barrier();
+        PcIdxPrep pp{iqk_.addr(), iq_.addr(), kr, g.idx_qn.addr(), rope_.addr(), (uint32_t)pos_, (uint32_t)c_.idx_heads,
+                     (uint32_t)c_.rope_dim, c_.rms_eps};
+        gpu_.dispatch("idx_prep", pp, n, c_.idx_heads + 1);
+        gpu_.barrier();
+        const int b0 = pos_ / R, b1 = (pos_ + n) / R;
+        if (b1 > b0) {
+            PcIdxPool pl{kr, kb, g.idx_kn.addr(), rope_.addr(), (uint32_t)b0, (uint32_t)R, (uint32_t)c_.rope_dim, c_.rms_eps};
+            gpu_.dispatch("idx_pool", pl, b1 - b0);
+            gpu_.barrier();
+        }
+        if (b1 <= TOPB) return 0;
+        PcIdxScore ps{iq_.addr(), kb, scores_.addr(), (uint32_t)pos_, (uint32_t)R, (uint32_t)c_.idx_heads, (uint32_t)nblk_};
+        gpu_.dispatch("idx_score", ps, groups(b1, 256), n);
+        gpu_.barrier();
+        PcIdxSel pt{scores_.addr(), isel_.addr(), (uint32_t)pos_, (uint32_t)R, (uint32_t)TOPB, (uint32_t)nblk_};
+        gpu_.dispatch("idx_select", pt, n);
+        gpu_.barrier();
+        return isel_.addr();
+    }
+
     void norm(Ptr x, uint64_t delta, Ptr w, Ptr out, int n) {
         PcNorm pc{x.addr(), delta, w.addr(), out.addr(), (uint32_t)c_.hidden, c_.rms_eps};
         gpu_.dispatch("add_rmsnorm", pc, n);
@@ -1058,8 +1242,8 @@ private:
     void deltanet(int l, int n) {
         const GLayer& g = L_[l];
         const int s = slot_[l];
-        mat_q(g.qkv, xn_, qkv_, n);
-        mat_q(g.z, xn_, z_, n);
+        lin(g.qkv, xn_, qkv_, n);
+        lin(g.z, xn_, z_, n);
         mat_b(g.a, xn_.addr(), a_.addr(), n, c_.hidden);
         mat_b(g.b, xn_.addr(), b_.addr(), n, c_.hidden);
         gpu_.barrier();
@@ -1073,19 +1257,20 @@ private:
                     (uint32_t)c_.lin_v_heads, (uint32_t)(c_.lin_v_heads / c_.lin_k_heads)};
         gpu_.dispatch("deltanet", pcd, c_.lin_v_heads, c_.lin_v_dim / 16);
         gpu_.barrier();
-        PcGatedNorm pcg{core_.addr(), z_.addr(), g.lnorm.addr(), (uint32_t)c_.lin_v_heads, c_.rms_eps};
+        PcGatedNorm pcg{core_.addr(), z_.addr(), g.lnorm.addr(), (uint32_t)c_.lin_v_heads, c_.rms_eps, c_.qwen4 ? 1u : 0u};
         gpu_.dispatch("gated_norm", pcg, n, c_.lin_v_heads);
         gpu_.barrier();
-        mat_q(g.out, core_, mix_, n);
+        lin(g.out, core_, mix_, n);
     }
 
     void attention(int l, int n) {
         const GLayer& g = L_[l];
         const VkDeviceSize kv = (VkDeviceSize)slot_[l] * max_ctx_ * c_.n_kv_heads * c_.head_dim * 4;
-        mat_q(g.q, xn_, qg_, n);
-        mat_q(g.k, xn_, kb_, n);
-        mat_q(g.v, xn_, vb_, n);
+        lin(g.q, xn_, qg_, n);
+        lin(g.k, xn_, kb_, n);
+        lin(g.v, xn_, vb_, n);
         gpu_.barrier();
+        const uint64_t sel = c_.qwen4 ? indexer(l, n) : 0;
         PcQkRope pr{qg_.addr(), kb_.addr(), vb_.addr(), qo_.addr(), kcache_->addr + kv, vcache_->addr + kv,
                     g.qn.addr(), g.kn.addr(), rope_.addr(), (uint32_t)pos_, (uint32_t)c_.n_heads,
                     (uint32_t)c_.n_kv_heads, (uint32_t)c_.rope_dim, c_.rms_eps};
@@ -1096,15 +1281,16 @@ private:
         int splits = n <= NT ? (maxlen + 255) / 256 : (maxlen + 1023) / 1024;
         splits = std::max(1, std::min(splits, std::min(64, ATT_PART_MAX / n)));
         const int chunk = (maxlen + splits - 1) / splits;
-        PcAttn pa{qo_.addr(), kcache_->addr + kv, vcache_->addr + kv, part_.addr(), (uint32_t)pos_,
+        PcAttn pa{qo_.addr(), kcache_->addr + kv, vcache_->addr + kv, part_.addr(), sel, (uint32_t)pos_,
                   (uint32_t)c_.n_heads, (uint32_t)c_.n_kv_heads, (uint32_t)chunk, (uint32_t)splits,
-                  1.0f / std::sqrt((float)c_.head_dim)};
+                  1.0f / std::sqrt((float)c_.head_dim), (uint32_t)c_.idx_ratio,
+                  (uint32_t)(c_.idx_ratio ? c_.idx_budget / c_.idx_ratio : 0)};
         gpu_.dispatch("attention", pa, n, c_.n_heads, splits);
         gpu_.barrier();
         PcAttnCombine pc{part_.addr(), qg_.addr(), att_.addr(), (uint32_t)c_.n_heads, (uint32_t)splits};
         gpu_.dispatch("attn_combine", pc, n, c_.n_heads);
         gpu_.barrier();
-        mat_q(g.o, att_, mix_, n);
+        lin(g.o, att_, mix_, n);
     }
 
     void moe(int l, int n) {
@@ -1113,9 +1299,17 @@ private:
         const uint64_t sel = sel_.addr() + (uint64_t)l * NMAX * TK * 4;
         mat_b(g.router, xn_.addr(), rlogits_.addr(), n, H, "router");
         mat_b(g.sgate, xn_.addr(), sgate_.addr(), n, H, "shared_gate");
-        mat_swiglu(g.sh_gate, g.sh_up, xn_, sact_, n);
-        gpu_.barrier();
-        mat_q(g.sh_down, sact_, sy_, n);
+        if (g.sh_gate.q.rows) {
+            mat_swiglu(g.sh_gate.q, g.sh_up.q, xn_, sact_, n);
+            gpu_.barrier();
+        } else {
+            mat_b(g.sh_gate.b, xn_.addr(), sact_.addr(), n, H);
+            mat_b(g.sh_up.b, xn_.addr(), su_.addr(), n, H);
+            gpu_.barrier();
+            ew(sact_, su_, (uint32_t)(n * c_.shared_inter), 1, 1.0f);
+            gpu_.barrier();
+        }
+        lin(g.sh_down, sact_, sy_, n);
         PcRoute pr{rlogits_.addr(), sel, selw_.addr(), (uint32_t)E, (uint32_t)TK};
         gpu_.dispatch("moe_route", pr, n);
         gpu_.barrier();
@@ -1160,7 +1354,9 @@ private:
                     (uint32_t)H, (uint32_t)I, (uint32_t)I, (uint32_t)H, 1};
         gpu_.dispatch_indirect(gemm ? (tc ? "gemm_coop_expert" : "gemm_fp8_expert") : "matmul_fp8_expert", pd, {args_.b, args_.off + 12});
         gpu_.barrier();
-        PcCombine pc{x_.addr(), sgate_.addr(), sy_.addr(), ey_.addr(), comb_.addr(), (uint32_t)H, (uint32_t)TK};
+        // qwen4 writes the block output (mixed into the streams by hc_out); otherwise add to the residual
+        PcCombine pc{c_.qwen4 ? mix_.addr() : x_.addr(), sgate_.addr(), sy_.addr(), ey_.addr(), comb_.addr(), (uint32_t)H,
+                     (uint32_t)TK, c_.qwen4 ? 0u : 1u};
         gpu_.dispatch("moe_combine", pc, groups(H, 256), n);
         gpu_.barrier();
     }
@@ -1276,17 +1472,27 @@ private:
         PcCombW pw{comb_.addr(), selw_.addr(), (uint32_t)(n * TK)};
         gpu_.dispatch("comb_weights", pw, groups(n * TK, 256));
         gpu_.barrier();
-        PcCombine pc{x_.addr(), sgate_.addr(), sy_.addr(), ey_.addr(), comb_.addr(), (uint32_t)H, (uint32_t)TK};
+        // qwen4 writes the block output (mixed into the streams by hc_out); otherwise add to the residual
+        PcCombine pc{c_.qwen4 ? mix_.addr() : x_.addr(), sgate_.addr(), sy_.addr(), ey_.addr(), comb_.addr(), (uint32_t)H,
+                     (uint32_t)TK, c_.qwen4 ? 0u : 1u};
         gpu_.dispatch("moe_combine", pc, groups(H, 256), n);
         gpu_.barrier();
     }
 
     void forward_chunk(const int* tokens, int n, float* logits) {
-        const int H = c_.hidden;
+        const int H = c_.hidden, S = c_.hc;
         float* hx = (float*)hx_->map;
-        for (int t = 0; t < n; t++) {
+        for (int t = 0; t < n; t++) {  // qwen4: every stream starts as the embedding
             const uint16_t* e = w_.embed.w + (size_t)tokens[t] * H;
-            for (int i = 0; i < H; i++) hx[(size_t)t * H + i] = bf16_to_f32(e[i]);
+            for (int i = 0; i < H; i++) hx[(size_t)t * HH_ + i] = bf16_to_f32(e[i]);
+            for (int s = 1; s < S; s++) std::memcpy(&hx[(size_t)t * HH_ + s * H], &hx[(size_t)t * HH_], H * 4);
+        }
+        if (hemb_) {
+            ck::ple_embed(*ple_pool_, c_, w_.ple, hist_, tokens, n, (float*)hemb_->map);
+            const int C = (int)hist_.size();
+            std::vector<int> all(hist_);
+            all.insert(all.end(), tokens, tokens + n);
+            for (int i = 0; i < C; i++) hist_[i] = all[all.size() - C + i];
         }
         tick_++;
         gpu_.begin();
@@ -1295,10 +1501,23 @@ private:
             if (where_[key] < 0 && !fill_slot(key)) break;
         up_.flush();  // non-pinned fills go through the staging buffer
         pending_.clear();
-        gpu_.copy(hx_, 0, x_.b, x_.off, (VkDeviceSize)n * H * 4);
+        gpu_.copy(hx_, 0, x_.b, x_.off, (VkDeviceSize)n * HH_ * 4);
+        if (hemb_) gpu_.copy(hemb_, 0, emb_.b, emb_.off, (VkDeviceSize)n * c_.ple_dim * 4);
         gpu_.barrier();
         for (int l = 0; l < c_.n_layers; l++) {
             const GLayer& g = L_[l];
+            if (c_.qwen4) {
+                if (l == c_.ple_layer) ple(n);
+                hc_in(g.attn_hc, x_, n);
+                if (w_.layers[l].full_attn) attention(l, n);
+                else deltanet(l, n);
+                gpu_.barrier();
+                hc_out(n);
+                hc_in(g.mlp_hc, x_, n);
+                moe(l, n);
+                hc_out(n);
+                continue;
+            }
             norm(x_, 0, g.in_norm, xn_, n);
             gpu_.barrier();
             if (w_.layers[l].full_attn) attention(l, n);
@@ -1309,8 +1528,9 @@ private:
             moe(l, n);
         }
         if (logits) {
-            const Ptr xl{x_.b, x_.off + (VkDeviceSize)(n - 1) * H * 4};
-            norm(xl, 0, final_norm_, xn_, 1);
+            const Ptr xl{x_.b, x_.off + (VkDeviceSize)(n - 1) * HH_ * 4};
+            if (c_.qwen4) hc_in(mixer_, xl, 1);
+            else norm(xl, 0, final_norm_, xn_, 1);
             gpu_.barrier();
             mat_b(lm_head_, xn_.addr(), logits_.addr(), 1, H, "lm_head");
             gpu_.barrier();

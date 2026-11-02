@@ -46,8 +46,9 @@ struct Options {
     bool greedy = false;
     bool no_pin = false;
     int hybrid = -1;
-    bool keep_think = false;
+    int keep_think = -1;  // -1: model default (qwen4 templates keep it, Qwen3.5/3.6 drop it)
     bool hide_think = false;
+    std::string effort = "xhigh";  // qwen4 reasoning effort: xhigh | medium | low
     bool no_stats = false;
 };
 
@@ -61,7 +62,9 @@ void usage() {
         "  --system TEXT        system prompt\n"
         "  --no-think           disable thinking mode\n"
         "  --hide-think         don't print the reasoning, show thinking... (a dot every 2s) instead (/think toggles)\n"
-        "  --keep-think         keep earlier turns' reasoning in the history (default: drop, like the template)\n"
+        "  --keep-think         keep earlier turns' reasoning in the history (default: as the model's template)\n"
+        "  --drop-think         drop earlier turns' reasoning from the history\n"
+        "  --effort LEVEL       reasoning effort for Qwen3.8-Flash-Next: xhigh (default), medium, low\n"
         "  -n N                 max new tokens per reply (default 4096)\n"
         "  --ctx N              context length (default 32768)\n"
         "  --temp T --top-k K --top-p P --seed S --greedy\n"
@@ -177,7 +180,9 @@ int main(int argc, char** argv) {
         }
         else if (a == "--system") o.system = next();
         else if (a == "--no-think") o.think = false;
-        else if (a == "--keep-think") o.keep_think = true;
+        else if (a == "--keep-think") o.keep_think = 1;
+        else if (a == "--drop-think") o.keep_think = 0;
+        else if (a == "--effort") o.effort = next();
         else if (a == "--hide-think") o.hide_think = true;
         else if (a == "-n") o.max_new = std::stoi(next());
         else if (a == "--ctx") o.max_ctx = std::stoi(next());
@@ -268,9 +273,22 @@ int main(int argc, char** argv) {
         // One chat turn. The history is kept in the form the official chat template renders it: earlier
         // assistant turns appear without their <think> block. The recurrent state is snapshotted right after
         // "<|im_start|>assistant\n"; once the reply is done we roll back to it and feed only the final answer.
+        const bool keep_think = o.keep_think < 0 ? cfg.qwen4 : o.keep_think == 1;
+        // qwen4 template: with thinking on, a reasoning-effort instruction leads the system message
+        std::string instr;
+        if (cfg.qwen4 && o.think) {
+            if (o.effort == "xhigh")
+                instr = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, "
+                        "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+            else if (o.effort == "low")
+                instr = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
+                        "conclusion without unnecessary elaboration.";
+            else if (o.effort != "medium") throw std::runtime_error("--effort must be xhigh, medium or low");
+        }
         auto run_turn = [&](const std::string& msg, bool first) {
             std::string head;
-            if (first && !o.system.empty()) head += "<|im_start|>system\n" + o.system + "<|im_end|>\n";
+            const std::string sys = o.system.empty() ? instr : instr.empty() ? o.system : instr + "\n\n" + o.system;
+            if (first && !sys.empty()) head += "<|im_start|>system\n" + sys + "<|im_end|>\n";
             if (!first) head += "\n";  // newline after the previous <|im_end|>
             head += "<|im_start|>user\n" + msg + "<|im_end|>\n<|im_start|>assistant\n";
             std::vector<int> ids = tok.encode(head);
@@ -279,7 +297,7 @@ int main(int argc, char** argv) {
 
             auto ts = std::chrono::steady_clock::now();
             be->forward(ids.data(), (int)ids.size(), logits.data());
-            if (!o.keep_think) be->save_state();
+            if (!keep_think) be->save_state();
             be->forward(gen_prompt.data(), (int)gen_prompt.size(), logits.data());
             const size_t n_prefill = ids.size() + gen_prompt.size();
             double prefill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
@@ -334,7 +352,7 @@ int main(int argc, char** argv) {
             out.flush();
             double gen_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tg).count();
 
-            if (o.keep_think) {
+            if (keep_think) {
                 // history keeps the reasoning; just close the turn if the model did not
                 if (!ended) be->forward(&im_end, 1, logits.data());
             } else {

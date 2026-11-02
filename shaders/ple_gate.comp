@@ -1,0 +1,30 @@
+// qwen4 PLE gate. One workgroup per (token t, stream s):
+//   g = <kn[t, s], qn[t, s]> / sqrt(dim); g = sign(g) * sqrt(max(|g|, 1e-6)); gv[t, s] = sigmoid(g) * val[t]
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t kn, qn, val, gv;
+    uint dim, streams;
+} pc;
+
+shared float red[8];
+
+void main() {
+    const uint t = gl_WorkGroupID.x, s = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+    const uint base = (t * pc.streams + s) * pc.dim;
+    F32 kn = F32(pc.kn), qn = F32(pc.qn);
+    float acc = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256u) acc += kn.v[base + i] * qn.v[base + i];
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = acc;
+    barrier();
+    float g = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; i++) g += red[i];
+    g *= inversesqrt(float(pc.dim));
+    g = sign(g) * sqrt(max(abs(g), 1e-6));
+    const float w = sigmoid(g);
+    F32 val = F32(pc.val + uint64_t(t) * pc.dim * 4u), gv = F32(pc.gv);
+    for (uint i = tid; i < pc.dim; i += 256u) gv.v[base + i] = w * val.v[i];
+}

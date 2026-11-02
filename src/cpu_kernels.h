@@ -25,11 +25,21 @@ struct MatJob {
     int cols() const { return q ? q->cols : b->cols; }
 };
 void run_jobs(ThreadPool& pool, const std::vector<MatJob>& jobs);
+inline MatJob job(const Lin& m, const float* x, float* y, int n) {
+    return m.fp8() ? MatJob{&m.q, nullptr, x, y, n} : MatJob{nullptr, &m.b, x, y, n};
+}
+inline MatJob job(const BMat& m, const float* x, float* y, int n) { return MatJob{nullptr, &m, x, y, n}; }
 
+float fp8_to_f32(uint8_t b);  // e4m3fn
 float dot_f32(const float* a, const float* b, int n);
 void axpy(float* out, float p, const float* v, int n);  // out += p * v
-void rmsnorm(const float* x, const BMat& w, float* out, int n, float eps, bool one_plus);
+// woff: offset into w (grouped norms use one weight slice per group)
+void rmsnorm(const float* x, const BMat& w, float* out, int n, float eps, bool one_plus, int woff = 0);
 // One gated-delta-rule step for a head with state S[KD][DV].
 void delta_step(float* S, const float* k, const float* q, const float* v, float beta, float decay, float* o, int KD, int DV);
+
+// qwen4 PLE: hashed n-gram embedding rows of n tokens (hist = the previous ngram-1 tokens) -> emb[n, ple_dim].
+void ple_embed(ThreadPool& pool, const Config& c, const Ple& P, const std::vector<int>& hist, const int* tokens, int n,
+               float* emb);
 
 }  // namespace ck

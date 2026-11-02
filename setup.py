@@ -1,5 +1,5 @@
 # One-shot setup: downloads model weights from Hugging Face into models/ and builds qwen.exe.
-# usage: python setup.py [--model 35b|122b|27b|all] [--no-build] [--cpu-only]
+# usage: python setup.py [--model 35b|122b|flash|27b|all|none] [--no-build] [--cpu-only]
 # Weights are not stored in git; re-running skips files that are already complete.
 import argparse, os, subprocess, sys
 
@@ -7,10 +7,12 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 MODELS = {
     "35b": "Qwen/Qwen3.6-35B-A3B-FP8",     # default model (chat.bat), ~35 GB
     "122b": "Qwen/Qwen3.5-122B-A10B-FP8",  # chat-122b.bat, ~119 GB
-    "27b": "Qwen/Qwen3.8-27B-FP8",         # ~12 GB
+    "flash": "Qwen/Qwen3.8-Flash-Next-FP8",  # 180B MoE, ~186 GB (engine support in progress)
+    "27b": "Qwen/Qwen3.8-27B-FP8",         # dense, ~31 GB (not supported by the engine yet)
 }
 
 def download(repo):
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")  # the Xet backend stalled mid-download; plain HTTP is ~115 MB/s
     try:
         from huggingface_hub import snapshot_download
     except ImportError:

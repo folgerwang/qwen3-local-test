@@ -56,7 +56,17 @@ if(QW_VULKAN)
         "gemm_coop|gemm_coop.comp|"
         "gemm_coop_swiglu|gemm_coop.comp|-DSWIGLU"
         "gemm_coop_expert|gemm_coop.comp|-DEXPERT"
-        "gemm_coop_expert_swiglu|gemm_coop.comp|-DEXPERT -DSWIGLU")
+        "gemm_coop_expert_swiglu|gemm_coop.comp|-DEXPERT -DSWIGLU"
+        "group_norm|group_norm.comp|"
+        "hc_mix|hc_mix.comp|"
+        "hc_out|hc_out.comp|"
+        "elementwise|elementwise.comp|"
+        "ple_gate|ple_gate.comp|"
+        "ple_conv|ple_conv.comp|"
+        "idx_prep|idx_prep.comp|"
+        "idx_pool|idx_pool.comp|"
+        "idx_score|idx_score.comp|"
+        "idx_select|idx_select.comp|")
     set(spv_files "")
     set(spv_args "")
     file(GLOB shader_deps ${CMAKE_SOURCE_DIR}/shaders/*)

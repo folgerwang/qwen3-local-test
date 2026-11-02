@@ -1,0 +1,39 @@
+// qwen4 indexer block keys: block b = b0 + workgroup: mean of the R raw keys of positions b*R .. b*R+R-1,
+// rmsnorm * (1 + kn), rope at position b*R. 128 threads = head dim D.
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 128) in;
+#define D 128
+layout(push_constant) uniform PC {
+    uint64_t kraw, kblk, kn, rope;
+    uint b0, ratio, rope_dim;
+    float eps;
+} pc;
+
+shared float sh[D];
+shared float red[4];
+
+void main() {
+    const uint b = pc.b0 + gl_WorkGroupID.x, d = gl_LocalInvocationID.x;
+    F32 kr = F32(pc.kraw);
+    float x = 0.0;
+    for (uint r = 0; r < pc.ratio; r++) x += kr.v[(b * pc.ratio + r) * D + d];
+    x /= float(pc.ratio);
+    const float ss = subgroupAdd(x * x);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = ss;
+    barrier();
+    float tot = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; i++) tot += red[i];
+    float y = x * inversesqrt(tot / float(D) + pc.eps) * (1.0 + F32(pc.kn).v[d]);
+    sh[d] = y;
+    barrier();
+    const uint half_ = pc.rope_dim / 2u;
+    if (d < pc.rope_dim) {
+        const uint i = d % half_;
+        F32 rp = F32(pc.rope + uint64_t(b * pc.ratio) * pc.rope_dim * 4u);
+        const float c = rp.v[2u * i], s = rp.v[2u * i + 1u];
+        y = d < half_ ? sh[d] * c - sh[d + half_] * s : sh[d] * c + sh[i] * s;
+    }
+    F32(pc.kblk).v[b * D + d] = y;
+}
