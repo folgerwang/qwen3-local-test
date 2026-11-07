@@ -103,6 +103,18 @@ void SafeTensors::add_file(const std::string& path) {
     files_.push_back(std::move(f));
 }
 
+void SafeTensors::release_pages() const {
+    for (auto& f : files_) {
+#ifdef _WIN32
+        // VirtualUnlock on pages that are not locked takes them out of the working set: they stay in the file
+        // cache (standby) and come back on the next access, but no longer count as this process's memory.
+        VirtualUnlock((LPVOID)f->data(), f->size());
+#else
+        madvise((void*)f->data(), f->size(), MADV_DONTNEED);
+#endif
+    }
+}
+
 const TensorView* SafeTensors::find(const std::string& name) const {
     auto it = tensors_.find(name);
     return it == tensors_.end() ? nullptr : &it->second;

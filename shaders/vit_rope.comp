@@ -1,0 +1,24 @@
+// 2D rotary embedding of the vision tower, in place on q and k of the fused qkv rows [n][3][heads][hd]:
+// dims (j, j + hd/2) rotate by the per-patch angle j, table rope[t][hd/2] = (cos, sin). One workgroup per patch.
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t qkv, rope;
+    uint heads, hidden;
+} pc;
+
+void main() {
+    const uint t = gl_WorkGroupID.x, hd = pc.hidden / pc.heads, half_ = hd / 2u;
+    F32 r = F32(pc.rope + uint64_t(t) * half_ * 8u);
+    F32 q = F32(pc.qkv + uint64_t(t) * 3u * pc.hidden * 4u);
+    for (uint idx = gl_LocalInvocationID.x; idx < 2u * pc.heads * half_; idx += 256u) {
+        const uint j = idx % half_, h = (idx / half_) % pc.heads, which = idx / (half_ * pc.heads);  // 0 = q, 1 = k
+        const uint base = which * pc.hidden + h * hd;
+        const float c = r.v[2u * j], s = r.v[2u * j + 1u];
+        const float x1 = q.v[base + j], x2 = q.v[base + j + half_];
+        q.v[base + j] = x1 * c - x2 * s;
+        q.v[base + j + half_] = x2 * c + x1 * s;
+    }
+}

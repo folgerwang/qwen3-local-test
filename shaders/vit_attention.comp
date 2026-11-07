@@ -1,0 +1,67 @@
+// Bidirectional attention of the vision tower, head_dim 72, over all patches of one image. Workgroup = 64
+// queries of one head (one per thread); keys / values stream through shared memory in tiles of 32 with an
+// online softmax rescaled once per tile. q, k, v come from the fused qkv rows [n][3][heads][72].
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+#define D 72
+#define TK 32
+
+layout(push_constant) uniform PC {
+    uint64_t qkv, out_;
+    uint n, heads;
+    float scale;
+} pc;
+
+shared float Ks[TK][D];
+shared float Vs[TK][D];
+shared float S[64][TK + 1];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, h = gl_WorkGroupID.y, qi = gl_WorkGroupID.x * 64u + tid;
+    const uint hidden = pc.heads * D, stride = 3u * hidden;
+    const bool valid = qi < pc.n;
+    float q[D], o[D];
+    {
+        F32 qr = F32(pc.qkv + uint64_t(valid ? qi : 0u) * stride * 4u);
+        [[unroll]] for (uint d = 0; d < D; d++) { q[d] = qr.v[h * D + d] * pc.scale; o[d] = 0.0; }
+    }
+    float m = -1e30, l = 0.0;
+    for (uint kb = 0; kb < pc.n; kb += TK) {
+        for (uint idx = tid; idx < TK * D; idx += 64u) {
+            const uint kk = idx / D, d = idx % D, key = kb + kk;
+            float kv = 0.0, vv = 0.0;
+            if (key < pc.n) {
+                F32 kr = F32(pc.qkv + uint64_t(key) * stride * 4u);
+                kv = kr.v[hidden + h * D + d];
+                vv = kr.v[2u * hidden + h * D + d];
+            }
+            Ks[kk][d] = kv;
+            Vs[kk][d] = vv;
+        }
+        barrier();
+        const uint kn = min(TK, pc.n - kb);
+        float mt = -1e30;
+        for (uint kk = 0; kk < kn; kk++) {
+            float s = 0.0;
+            [[unroll]] for (uint d = 0; d < D; d++) s += q[d] * Ks[kk][d];
+            S[tid][kk] = s;
+            mt = max(mt, s);
+        }
+        const float mn = max(m, mt), corr = exp(m - mn);
+        l *= corr;
+        [[unroll]] for (uint d = 0; d < D; d++) o[d] *= corr;
+        for (uint kk = 0; kk < kn; kk++) {
+            const float p = exp(S[tid][kk] - mn);
+            l += p;
+            [[unroll]] for (uint d = 0; d < D; d++) o[d] += p * Vs[kk][d];
+        }
+        m = mn;
+        barrier();
+    }
+    if (!valid) return;
+    F32 outr = F32(pc.out_ + uint64_t(qi) * hidden * 4u);
+    const float inv = 1.0 / l;
+    [[unroll]] for (uint d = 0; d < D; d++) outr.v[h * D + d] = o[d] * inv;
+}

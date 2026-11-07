@@ -12,11 +12,20 @@ add_executable(qwen
     src/model.cpp
     src/safetensors.cpp
     src/tokenizer.cpp
+    src/term.cpp
+    src/vision.cpp
+    src/http.cpp
+    src/sysmem.cpp
+    src/tools.cpp
     src/cpu_backend.cpp
     src/cpu_kernels.cpp)
 
 if(MSVC)
     target_compile_options(qwen PRIVATE /O2 /utf-8 /W3 /bigobj /fp:fast)
+    # the image decoder's and web client's DLLs load on first use only (loaded at startup, they cost the
+    # CRT its final stdout flush)
+    target_link_options(qwen PRIVATE /DELAYLOAD:WindowsCodecs.dll /DELAYLOAD:ole32.dll /DELAYLOAD:winhttp.dll)
+    target_link_libraries(qwen PRIVATE delayimp.lib)
     if(QW_NATIVE)
         target_compile_options(qwen PRIVATE /arch:AVX512)
     endif()
@@ -56,7 +65,21 @@ if(QW_VULKAN)
         "gemm_coop|gemm_coop.comp|"
         "gemm_coop_swiglu|gemm_coop.comp|-DSWIGLU"
         "gemm_coop_expert|gemm_coop.comp|-DEXPERT"
-        "gemm_coop_expert_swiglu|gemm_coop.comp|-DEXPERT -DSWIGLU")
+        "gemm_coop_expert_swiglu|gemm_coop.comp|-DEXPERT -DSWIGLU"
+        "group_norm|group_norm.comp|"
+        "hc_mix|hc_mix.comp|"
+        "hc_out|hc_out.comp|"
+        "elementwise|elementwise.comp|"
+        "ple_gate|ple_gate.comp|"
+        "ple_conv|ple_conv.comp|"
+        "idx_prep|idx_prep.comp|"
+        "idx_pool|idx_pool.comp|"
+        "idx_score|idx_score.comp|"
+        "idx_select|idx_select.comp|"
+        "gemm_bf16|gemm_bf16.comp|"
+        "layer_norm|layer_norm.comp|"
+        "vit_rope|vit_rope.comp|"
+        "vit_attention|vit_attention.comp|")
     set(spv_files "")
     set(spv_args "")
     file(GLOB shader_deps ${CMAKE_SOURCE_DIR}/shaders/*)

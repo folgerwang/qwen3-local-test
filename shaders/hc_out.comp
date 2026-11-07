@@ -1,0 +1,20 @@
+// qwen4 hyper-connection output: x[t, s*dim + j] += y[t, j] * 2 * sigmoid(inj[t, s] / streams).
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t x, y, inj;
+    uint dim, streams;
+} pc;
+
+void main() {
+    const uint j = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
+    if (j >= pc.dim) return;
+    F32 x = F32(pc.x);
+    const float y = F32(pc.y).v[t * pc.dim + j];
+    for (uint s = 0; s < pc.streams; s++) {
+        const float w = 2.0 * sigmoid(F32(pc.inj).v[t * pc.streams + s] / float(pc.streams));
+        x.v[(t * pc.streams + s) * pc.dim + j] += y * w;
+    }
+}

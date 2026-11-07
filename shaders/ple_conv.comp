@@ -1,0 +1,33 @@
+// qwen4 PLE output: x[t] += gv[t] + silu(conv(gvn)[t]), where conv is a causal depthwise conv with kernel K and
+// dilation DIL over the normed values gvn. One thread per channel, sequential over tokens.
+// state holds the previous (K-1)*DIL normed inputs per channel, oldest first: state[i * channels + ch].
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+#define K 4
+#define DIL 3
+#define ST ((K - 1) * DIL)
+layout(push_constant) uniform PC {
+    uint64_t gv, gvn, x, w, state;
+    uint n, channels;
+} pc;
+
+void main() {
+    const uint ch = gl_GlobalInvocationID.x;
+    if (ch >= pc.channels) return;
+    F32 gv = F32(pc.gv), gvn = F32(pc.gvn), x = F32(pc.x), st = F32(pc.state), w = F32(pc.w);
+    float wk[K], hist[ST];
+    [[unroll]] for (uint k = 0; k < K; k++) wk[k] = w.v[ch * K + k];
+    [[unroll]] for (uint i = 0; i < ST; i++) hist[i] = st.v[i * pc.channels + ch];
+    for (uint t = 0; t < pc.n; t++) {
+        const uint idx = t * pc.channels + ch;
+        const float in_ = gvn.v[idx];
+        float acc = wk[K - 1] * in_;
+        [[unroll]] for (uint k = 0; k < K - 1; k++) acc += wk[k] * hist[k * DIL];
+        [[unroll]] for (uint i = 0; i < ST - 1; i++) hist[i] = hist[i + 1];
+        hist[ST - 1] = in_;
+        x.v[idx] += gv.v[idx] + silu(acc);
+    }
+    [[unroll]] for (uint i = 0; i < ST; i++) st.v[i * pc.channels + ch] = hist[i];
+}

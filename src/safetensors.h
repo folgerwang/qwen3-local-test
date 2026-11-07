@@ -45,10 +45,13 @@ private:
 // All *.safetensors files in a model directory, indexed by tensor name.
 class SafeTensors {
 public:
+    SafeTensors() = default;
     explicit SafeTensors(const std::string& dir);
     const TensorView& get(const std::string& name) const;
     const TensorView* find(const std::string& name) const;
     size_t count() const { return tensors_.size(); }
+    // Drops the mapped pages from the process's working set (they stay in the OS file cache).
+    void release_pages() const;
 
 private:
     void add_file(const std::string& path);

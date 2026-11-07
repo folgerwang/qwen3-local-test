@@ -1,0 +1,79 @@
+// Tiled GEMM for the vision tower: Y[t, r] = act(sum_c W[r, c] * X[t, c] + bias[r]), added to Y when
+// accumulating (residual). W BF16 [rows, cols], X / Y / bias f32. Workgroup tile = 64 rows x 64 tokens,
+// K step 16, 4x4 outputs per thread. act: 0 none, 1 GELU (tanh approximation), 2 GELU (erf).
+// cols must be a multiple of 16; rows and token counts are arbitrary.
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+#define BM 64
+#define BN 64
+#define BK 16
+
+layout(push_constant) uniform PC {
+    uint64_t w, bias, x, y;
+    uint rows, cols, n, x_stride, y_stride, act, accumulate;
+} pc;
+
+shared vec4 Ws[BK][BM / 4];
+shared vec4 Xs[BK][BN / 4];
+
+// Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7)
+float erf_approx(float x) {
+    const float t = 1.0 / (1.0 + 0.3275911 * abs(x));
+    const float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-x * x);
+    return x < 0.0 ? -y : y;
+}
+
+float activate(float v) {
+    if (pc.act == 1u) {
+        const float u = 0.7978845608028654 * (v + 0.044715 * v * v * v);
+        return 0.5 * v * (1.0 + tanh(clamp(u, -15.0, 15.0)));
+    }
+    if (pc.act == 2u) return 0.5 * v * (1.0 + erf_approx(v * 0.7071067811865476));
+    return v;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, ty = tid / 16u, tx = tid % 16u;
+    const uint r0 = gl_WorkGroupID.x * BM, t0 = gl_WorkGroupID.y * BN;
+    const uint ntok = min(BN, pc.n - t0), cols = pc.cols;
+    // loader roles: weight row / token = tid / 4, 4-wide k segment = tid % 4
+    const uint lr = tid / 4u, lk = (tid % 4u) * 4u;
+    const uint wrow = r0 + lr;
+    const bool row_ok = wrow < pc.rows, tok_ok = lr < ntok;
+    F4 xs = F4(pc.x + uint64_t(t0 + lr) * pc.x_stride * 4u);
+
+    vec4 acc[4];
+    [[unroll]] for (uint i = 0; i < 4u; i++) acc[i] = vec4(0.0);  // acc[i][j]: row ty*4+i, token tx*4+j
+
+    for (uint k0 = 0; k0 < cols; k0 += BK) {
+        vec4 a = vec4(0.0), b = vec4(0.0);
+        if (row_ok) a = bf16x2x2(U2(pc.w).v[(wrow * cols + k0 + lk) / 4u]);
+        if (tok_ok) b = xs.v[(k0 + lk) / 4u];
+        [[unroll]] for (uint j = 0; j < 4u; j++) {
+            Ws[lk + j][lr / 4u][lr % 4u] = a[j];
+            Xs[lk + j][lr / 4u][lr % 4u] = b[j];
+        }
+        barrier();
+        [[unroll]] for (uint k = 0; k < BK; k++) {
+            const vec4 wv = Ws[k][ty], xv = Xs[k][tx];
+            acc[0] += wv.x * xv; acc[1] += wv.y * xv; acc[2] += wv.z * xv; acc[3] += wv.w * xv;
+        }
+        barrier();
+    }
+    [[unroll]] for (uint j = 0; j < 4u; j++) {
+        const uint tok = tx * 4u + j;
+        if (tok >= ntok) break;
+        F32 y = F32(pc.y + uint64_t(t0 + tok) * pc.y_stride * 4u);
+        [[unroll]] for (uint i = 0; i < 4u; i++) {
+            const uint r = r0 + ty * 4u + i;
+            if (r >= pc.rows) break;
+            float v = acc[i][j];
+            if (pc.bias != 0ul) v += F32(pc.bias).v[r];
+            v = activate(v);
+            if (pc.accumulate != 0u) v += y.v[r];
+            y.v[r] = v;
+        }
+    }
+}

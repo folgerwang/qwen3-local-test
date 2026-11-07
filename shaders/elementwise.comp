@@ -1,0 +1,18 @@
+// Elementwise helpers over n floats. mode 0: a = silu(a * scale); mode 1: a = silu(a) * b.
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t a, b;
+    uint n, mode;
+    float scale;
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    F32 a = F32(pc.a);
+    if (pc.mode == 0u) a.v[i] = silu(a.v[i] * pc.scale);
+    else a.v[i] = silu(a.v[i]) * F32(pc.b).v[i];
+}

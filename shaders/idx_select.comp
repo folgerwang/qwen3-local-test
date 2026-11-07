@@ -1,0 +1,58 @@
+// qwen4 indexer top-k: per token, the `topb` highest-scoring complete blocks (ties -> lower block index).
+// Output row t of sel: [count, block ids...]; count = 0xFFFFFFFF when every block is selected (dense attention).
+// Scores are >= 0, so their float bits order like the values: a 4-pass 8-bit radix select finds the k-th key.
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t scores, sel;
+    uint pos, ratio, topb, stride;
+} pc;
+
+shared uint hist[256];
+shared uint s_prefix, s_k, s_cnt;
+
+void main() {
+    const uint t = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
+    const uint nb = (pc.pos + t + 1u) / pc.ratio;
+    U32W out_ = U32W(pc.sel + uint64_t(t) * (pc.topb + 1u) * 4u);
+    if (nb <= pc.topb) {
+        if (tid == 0u) out_.v[0] = 0xFFFFFFFFu;
+        return;
+    }
+    F32 sc = F32(pc.scores + uint64_t(t) * pc.stride * 4u);
+    if (tid == 0u) { s_prefix = 0u; s_k = pc.topb; s_cnt = 0u; }
+    uint mask = 0u;
+    for (int pass = 0; pass < 4; pass++) {
+        const uint shift = 24u - 8u * uint(pass);
+        hist[tid] = 0u;
+        barrier();
+        const uint prefix = s_prefix;
+        for (uint b = tid; b < nb; b += 256u) {
+            const uint key = floatBitsToUint(sc.v[b]);
+            if ((key & mask) == prefix) atomicAdd(hist[(key >> shift) & 255u], 1u);
+        }
+        barrier();
+        if (tid == 0u) {
+            uint cum = 0u, k = s_k;
+            for (int bin = 255; bin >= 0; bin--) {
+                const uint c = hist[bin];
+                if (cum + c >= k) { s_prefix = prefix | (uint(bin) << shift); s_k = k - cum; break; }
+                cum += c;
+            }
+        }
+        mask |= 255u << shift;
+        barrier();
+    }
+    const uint thr = s_prefix;  // key of the topb-th largest score; s_k of the ties are taken
+    for (uint b = tid; b < nb; b += 256u)
+        if (floatBitsToUint(sc.v[b]) > thr) out_.v[1u + atomicAdd(s_cnt, 1u)] = b;
+    barrier();
+    if (tid == 0u) {
+        uint c = s_cnt, need = s_k;
+        for (uint b = 0; b < nb && need > 0u; b++)
+            if (floatBitsToUint(sc.v[b]) == thr) { out_.v[1u + c++] = b; need--; }
+        out_.v[0] = c;
+    }
+}

@@ -2,6 +2,6 @@
 models/
 build/
 *.log
-# 867 MB reference tensor, regenerate with tests/ref_logits.py
-tests/ref_last_logits.pt
+# reference logit tensors (867 MB+), regenerate with tests/ref_logits*.py
+tests/*.pt
 __pycache__/

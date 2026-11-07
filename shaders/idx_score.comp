@@ -1,0 +1,33 @@
+// qwen4 indexer scores: score[t, b] = sum_h relu(<iq[t, h], kblk[b]>) / sqrt(D) for the complete blocks
+// b < (pos + t + 1) / ratio. Workgroup = (256 blocks, token t); the token's queries are kept in shared memory.
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+#define D 128
+#define MAXH 8
+layout(push_constant) uniform PC {
+    uint64_t iq, kblk, scores;
+    uint pos, ratio, n_heads, stride;
+} pc;
+
+shared vec4 qs[MAXH * D / 4];
+
+void main() {
+    const uint t = gl_WorkGroupID.y, b = gl_GlobalInvocationID.x, tid = gl_LocalInvocationID.x;
+    F4 iq = F4(pc.iq + uint64_t(t) * pc.n_heads * D * 4u);
+    for (uint i = tid; i < pc.n_heads * D / 4u; i += 256u) qs[i] = iq.v[i];
+    barrier();
+    const uint nb = (pc.pos + t + 1u) / pc.ratio;
+    if (b >= nb) return;
+    F4 kb = F4(pc.kblk + uint64_t(b) * D * 4u);
+    float acc[MAXH];
+    for (uint h = 0; h < pc.n_heads; h++) acc[h] = 0.0;
+    for (uint i = 0; i < D / 4u; i++) {
+        const vec4 k = kb.v[i];
+        for (uint h = 0; h < pc.n_heads; h++) acc[h] += dot(qs[h * (D / 4u) + i], k);
+    }
+    float s = 0.0;
+    for (uint h = 0; h < pc.n_heads; h++) s += max(acc[h], 0.0);
+    F32(pc.scores + uint64_t(t) * pc.stride * 4u).v[b] = s * inversesqrt(float(D));
+}

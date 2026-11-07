@@ -1,0 +1,37 @@
+// LayerNorm over rows of `dim` floats: y = (x - mean) / sqrt(var + eps) * w + b. One workgroup per row.
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t x, w, b, y;
+    uint dim;
+    float eps;
+} pc;
+
+shared float red[8];
+
+float block_sum(float v) {
+    v = subgroupAdd(v);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = v;
+    barrier();
+    float t = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; i++) t += red[i];
+    barrier();
+    return t;
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
+    F32 x = F32(pc.x + uint64_t(row) * pc.dim * 4u), y = F32(pc.y + uint64_t(row) * pc.dim * 4u);
+    float s = 0.0;
+    for (uint d = tid; d < pc.dim; d += 256u) s += x.v[d];
+    const float mean = block_sum(s) / float(pc.dim);
+    float v = 0.0;
+    for (uint d = tid; d < pc.dim; d += 256u) {
+        const float c = x.v[d] - mean;
+        v += c * c;
+    }
+    const float inv = inversesqrt(block_sum(v) / float(pc.dim) + pc.eps);
+    for (uint d = tid; d < pc.dim; d += 256u) y.v[d] = (x.v[d] - mean) * inv * F32(pc.w).v[d] + F32(pc.b).v[d];
+}

@@ -41,6 +41,8 @@ struct Fp8Lut {
 };
 const Fp8Lut g_fp8;
 
+float fp8_to_f32(uint8_t b) { return g_fp8.v[b]; }
+
 
 // ---------------------------------------------------------------------------------------------
 // Dot-product kernels. `scale_row` points to cols/128 bf16 block scales for this row.
@@ -303,14 +305,45 @@ void axpy(float* out, float p, const float* v, int n) {
     for (; i < n; i++) out[i] += p * v[i];
 }
 
-void rmsnorm(const float* x, const BMat& w, float* out, int n, float eps, bool one_plus) {
+void rmsnorm(const float* x, const BMat& w, float* out, int n, float eps, bool one_plus, int woff) {
     double ss = 0;
     for (int i = 0; i < n; i++) ss += (double)x[i] * x[i];
     float r = 1.0f / std::sqrt((float)(ss / n) + eps);
     for (int i = 0; i < n; i++) {
-        float wi = w.at(i);
+        float wi = w.at(woff + i);
         out[i] = x[i] * r * (one_plus ? 1.0f + wi : wi);
     }
+}
+
+void ple_embed(ThreadPool& pool, const Config& c, const Ple& P, const std::vector<int>& hist, const int* tokens, int n,
+               float* emb) {
+    const int NG = c.ngram, C = NG - 1, HPN = c.ngram_heads / C, D = c.ple_dim, eos = c.ple_eos;
+    std::vector<int> h(hist);  // previous C tokens, then this chunk
+    h.insert(h.end(), tokens, tokens + n);
+    pool.parallel_for(n, [&](int64_t b, int64_t e) {
+        for (int64_t t = b; t < e; t++) {
+            const int i = C + (int)t;
+            // shifted[s] = token i-s if no eos lies in [i-s, i-1] (same segment), else eos
+            int64_t sh[4];
+            sh[0] = h[i];
+            bool ok = true;
+            for (int s = 1; s < NG; s++) {
+                ok = ok && h[i - s] != eos;
+                sh[s] = ok ? h[i - s] : eos;
+            }
+            for (int g = 2; g <= NG; g++) {
+                uint64_t mixed = (uint64_t)(sh[0] * P.mult[0]);
+                for (int p = 1; p < g; p++) mixed ^= (uint64_t)(sh[p] * P.mult[p]);
+                for (int k = 0; k < HPN; k++) {
+                    const int hd = (g - 2) * HPN + k;
+                    const int64_t row = (int64_t)(mixed % (uint64_t)P.sizes[hd]) + P.offsets[hd];
+                    const uint8_t* src = P.shards[row / P.shard_rows] + (size_t)(row % P.shard_rows) * P.dim;
+                    float* dst = &emb[(size_t)t * D + hd * P.dim];
+                    for (int j = 0; j < P.dim; j++) dst[j] = fp8_to_f32(src[j]) * P.scale;
+                }
+            }
+        }
+    });
 }
 
 }  // namespace ck
