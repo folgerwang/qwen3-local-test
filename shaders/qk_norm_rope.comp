@@ -1,6 +1,8 @@
 // Per (token, head): rmsnorm(1+w) over head_dim 256, then partial RoPE on the first rope_dim dims.
 // Query heads (y < n_heads) read from the interleaved [query|gate] projection and write to q.
 // Key heads write the K cache at position pos+t and also copy V into the V cache.
+// Rotary positions are pos+t+rope_off (images shift them), or with pos3 != 0 per-token (t, h, w) positions
+// for image tokens: interleaved M-RoPE, frequency i follows component i % 3.
 #version 460
 #include "common.glsl"
 
@@ -8,8 +10,10 @@ layout(local_size_x = 256) in;
 #define D 256
 layout(push_constant) uniform PC {
     uint64_t qg, k, v, q_out, kcache, vcache, qn, kn, rope;  // rope: [pos][rope_dim/2] of (cos, sin)
+    uint64_t pos3;                                           // [n][3] rotary positions, or 0
     uint pos, n_heads, n_kv, rope_dim;
     float eps;
+    int rope_off;
 } pc;
 
 shared float sh[D];
@@ -32,7 +36,8 @@ void main() {
     const uint p = pc.pos + t, half_ = pc.rope_dim / 2u;
     if (d < pc.rope_dim) {
         const uint i = d % half_;
-        F32 rp = F32(pc.rope + uint64_t(p) * pc.rope_dim * 4u);
+        const uint pr = pc.pos3 != 0ul ? U32(pc.pos3).v[t * 3u + i % 3u] : uint(int(p) + pc.rope_off);
+        F32 rp = F32(pc.rope + uint64_t(pr) * pc.rope_dim * 4u);
         const float c = rp.v[2u * i], s = rp.v[2u * i + 1u];
         y = d < half_ ? sh[d] * c - sh[d + half_] * s : sh[d] * c + sh[i] * s;
     }

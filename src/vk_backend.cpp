@@ -18,6 +18,11 @@
 //
 // Shaders get every buffer as a device address in push constants; there are no descriptor sets.
 #include <vulkan/vulkan.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -36,6 +41,7 @@
 #include "backend.h"
 #include "cpu_kernels.h"
 #include "shaders_spv.h"
+#include "vision.h"
 
 namespace {
 
@@ -254,6 +260,24 @@ public:
     }
 
     const char* device_name() const { return props_.deviceName; }
+
+    // This process's device-local memory use and the heap size.
+    void vram(VkDeviceSize& used, VkDeviceSize& total) const {
+        int heap = -1;
+        for (uint32_t i = 0; i < memprops_.memoryHeapCount; i++)
+            if ((memprops_.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+                (heap < 0 || memprops_.memoryHeaps[i].size > memprops_.memoryHeaps[heap].size))
+                heap = (int)i;
+        total = memprops_.memoryHeaps[heap].size;
+        used = allocated_device_;
+        if (has_budget_) {
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT bp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+            VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+            mp.pNext = &bp;
+            vkGetPhysicalDeviceMemoryProperties2(phys_, &mp);
+            used = bp.heapUsage[heap];
+        }
+    }
 
     // Free device-local memory we may still allocate (budget - usage), or heap size if unknown.
     VkDeviceSize device_free() const {
@@ -560,7 +584,7 @@ struct PcNorm { uint64_t x, delta, w, out; uint32_t dim; float eps; };
 struct PcConv { uint64_t data, w, state; uint32_t n, channels; };
 struct PcDelta { uint64_t qkv, a, b, neg_a, dt_bias, state, out; uint32_t n, conv_dim, key_dim, n_v_heads, ratio; };
 struct PcGatedNorm { uint64_t o, z, w; uint32_t n_heads; float eps; uint32_t sigm; };
-struct PcQkRope { uint64_t qg, k, v, q_out, kcache, vcache, qn, kn, rope; uint32_t pos, n_heads, n_kv, rope_dim; float eps; };
+struct PcQkRope { uint64_t qg, k, v, q_out, kcache, vcache, qn, kn, rope, pos3; uint32_t pos, n_heads, n_kv, rope_dim; float eps; int32_t rope_off; };
 struct PcAttn { uint64_t q, kcache, vcache, part, sel; uint32_t pos, n_heads, n_kv, chunk, n_split; float scale; uint32_t ratio, topb; };
 struct PcAttnCombine { uint64_t part, qg, out; uint32_t n_heads, n_split; };
 struct PcRoute { uint64_t logits, sel, selw; uint32_t n_experts, top_k; };
@@ -578,6 +602,11 @@ struct PcIdxPrep { uint64_t qk, iq, kraw, qn, rope; uint32_t pos, n_heads, rope_
 struct PcIdxPool { uint64_t kraw, kblk, kn, rope; uint32_t b0, ratio, rope_dim; float eps; };
 struct PcIdxScore { uint64_t iq, kblk, scores; uint32_t pos, ratio, n_heads, stride; };
 struct PcIdxSel { uint64_t scores, sel; uint32_t pos, ratio, topb, stride; };
+// vision tower
+struct PcGemmB { uint64_t w, bias, x, y; uint32_t rows, cols, n, x_stride, y_stride, act, accumulate; };
+struct PcLayerNorm { uint64_t x, w, b, y; uint32_t dim; float eps; };
+struct PcVitRope { uint64_t qkv, rope; uint32_t heads, hidden; };
+struct PcVitAttn { uint64_t qkv, out; uint32_t n, heads; float scale; };
 
 struct ExpertEntry { uint64_t base; uint32_t start, count; };  // matches `Entry` in the expert shaders
 static_assert(sizeof(ExpertEntry) == 16, "ExpertEntry layout");
@@ -601,6 +630,12 @@ struct GLayer {
     GB idx_qk; Ptr idx_qn, idx_kn;          // qwen4 indexer
 };
 
+// vision tower: BF16 matrices, f32 biases and LayerNorm parameters
+struct GVBlock {
+    Ptr n1w, n1b, n2w, n2b, qkv_b, proj_b, fc1_b, fc2_b;
+    GB qkv, proj, fc1, fc2;
+};
+
 uint32_t groups(uint32_t n, uint32_t per) { return (n + per - 1) / per; }
 
 // ---------------------------------------------------------------------------------------------
@@ -610,6 +645,7 @@ public:
         : c_(c), w_(w), max_ctx_(max_ctx), opt_(opt), arena_(gpu_), up_(gpu_) {
         upload_weights();
         alloc_state();
+        setup_vision();  // before the expert cache takes the remaining VRAM
         setup_experts();
         reset();
     }
@@ -623,6 +659,7 @@ public:
 
     void reset() override {
         pos_ = 0;
+        rope_delta_ = 0;
         gpu_.begin();
         gpu_.fill_zero(conv_state_);
         gpu_.fill_zero(rec_state_);
@@ -641,6 +678,7 @@ public:
         if (ple_state_) gpu_.copy(ple_state_, 0, ple_saved_, 0, ple_state_->size);
         gpu_.submit_wait();
         saved_pos_ = pos_;
+        saved_rope_delta_ = rope_delta_;
         saved_hist_ = hist_;
     }
     void restore_state() override {
@@ -650,6 +688,7 @@ public:
         if (ple_state_) gpu_.copy(ple_saved_, 0, ple_state_, 0, ple_state_->size);
         gpu_.submit_wait();
         pos_ = saved_pos_;
+        rope_delta_ = saved_rope_delta_;
         hist_ = saved_hist_;
     }
 
@@ -662,12 +701,62 @@ public:
         }
     }
 
+    std::string memory_report() const override {
+        VkDeviceSize used = 0, total = 0;
+        gpu_.vram(used, total);
+        char b[256];
+        std::snprintf(b, sizeof b, "VRAM %.1f / %.1f GB (expert cache %.1f GB = %.0f%% of experts)", used / 1073741824.0,
+                      total / 1073741824.0, slots_.size() * slot_size_ / 1073741824.0, 100.0 * slots_.size() / n_keys());
+        std::string s = b;
+        if (pinned_) {
+            std::snprintf(b, sizeof b, " \xC2\xB7 pinned expert copies %.1f GB of RAM", n_keys() * slot_size_ / 1073741824.0);
+            s += b;
+        } else if (hybrid_) {
+            s += " \xC2\xB7 no pinned RAM (the CPU runs uncached experts)";
+        }
+        return s;
+    }
+
+    bool has_vision() const override { return vis_max_ > 0; }
+
+    std::vector<float> encode_image(const ImageInput& in) override {
+        if (!has_vision()) throw std::runtime_error("this model has no vision tower loaded");
+        const int N = in.gh * in.gw;
+        if (N > vis_max_) throw std::runtime_error("image larger than the vision buffers");
+        encode(in);
+        const int T = in.tokens();
+        std::vector<float> out((size_t)T * c_.hidden);
+        std::memcpy(out.data(), hvout_->map, out.size() * 4);
+        return out;
+    }
+
+    // Image tokens: rotary position (t, h, w) = (s, s + row, s + col) from the current rotary position s;
+    // text after the image continues at s + max(lgh, lgw), so later rotary positions trail the KV slots.
+    void forward_image(const float* embeds, int lgh, int lgw, float* logits) override {
+        const int n = lgh * lgw;
+        if (pos_ + n > max_ctx_) throw std::runtime_error("context overflow");
+        const int s = pos_ + rope_delta_;
+        std::vector<uint32_t> p3((size_t)n * 3);
+        for (int k = 0; k < n; k++) {
+            p3[3 * k] = (uint32_t)s;
+            p3[3 * k + 1] = (uint32_t)(s + k / lgw);
+            p3[3 * k + 2] = (uint32_t)(s + k % lgw);
+        }
+        for (int done = 0; done < n;) {
+            const int m = std::min(NMAX, n - done);
+            forward_chunk(nullptr, m, done + m == n ? logits : nullptr, embeds + (size_t)done * c_.hidden, &p3[3 * done]);
+            done += m;
+        }
+        rope_delta_ += std::max(lgh, lgw) - n;
+    }
+
 private:
     const Config& c_;
     const ModelWeights& w_;
     int max_ctx_;
     VulkanOptions opt_;
     int pos_ = 0, saved_pos_ = 0;
+    int rope_delta_ = 0, saved_rope_delta_ = 0;  // rotary position - KV slot (<= 0 after images)
     Gpu gpu_;
     Arena arena_;
     Uploader up_;
@@ -688,6 +777,8 @@ private:
     Buf* rec_saved_ = nullptr;
     // host-visible
     Buf* hx_ = nullptr;     // embeddings of the current chunk
+    Buf* hpos3_ = nullptr;  // rotary (t, h, w) positions of image tokens in the current chunk
+    uint64_t pos3_ = 0;     // its address while the chunk holds image tokens, else 0
     Buf* hsel_ = nullptr;   // selected expert ids, [layer][NMAX * top_k]
     Buf* hlog_ = nullptr;   // final logits
     // qwen4: x_ holds hc streams [n, hc * hidden]; xn_ the mixed block input; mix_ the block output
@@ -723,6 +814,15 @@ private:
     std::vector<uint64_t> usage_;           // selection counts per key (persisted)
     VkDeviceSize slot_size_ = 0, off_up_ = 0, off_down_ = 0, off_sg_ = 0, off_su_ = 0, off_sd_ = 0;
     uint64_t tick_ = 0, hits_ = 0, misses_ = 0, fills_ = 0;
+
+    // vision tower
+    int vis_max_ = 0;                       // patches the buffers hold (0 = no vision)
+    GB vpatch_w_, vmerge_fc1_, vmerge_fc2_;
+    Ptr vpatch_b_, vmerge_nw_, vmerge_nb_, vmerge_fc1_b_, vmerge_fc2_b_;
+    std::vector<GVBlock> VB_;
+    Ptr vx_, vn_, vqkv_, vatt_, vmlp_, vrope_, vout_;
+    Buf* hvin_ = nullptr;                   // patches | position embeddings | rotary table (host -> GPU)
+    Buf* hvout_ = nullptr;                  // merged embeddings (GPU -> host)
 
     // ---- setup ----------------------------------------------------------------------------
     GQ up_q(const QMat& m) {
@@ -905,6 +1005,112 @@ private:
         }
         hsel_ = gpu_.create((VkDeviceSize)c_.n_layers * NMAX * TK * 4, Mem::HostRead);
         hlog_ = gpu_.create((VkDeviceSize)c_.vocab * 4, Mem::HostRead);
+        hpos3_ = gpu_.create((VkDeviceSize)NMAX * 3 * 4, Mem::HostUpload);
+    }
+
+    // ---- vision tower -------------------------------------------------------------------------
+    void setup_vision() {
+        const Config::Vision& vc = c_.vis;
+        const VisionWeights& V = w_.vis;
+        if (!opt_.vision || !vc.depth || V.blocks.empty()) return;
+        const int VH = vc.hidden, PD = vc.patch_dim(), M4 = VH * vc.merge * vc.merge;
+        vpatch_w_ = up_b(V.patch_w);
+        vpatch_b_ = up_f32(to_f32(V.patch_b));
+        for (const VisionBlock& B : V.blocks) {
+            GVBlock g;
+            g.n1w = up_f32(to_f32(B.norm1_w)); g.n1b = up_f32(to_f32(B.norm1_b));
+            g.n2w = up_f32(to_f32(B.norm2_w)); g.n2b = up_f32(to_f32(B.norm2_b));
+            g.qkv = up_b(B.qkv_w); g.qkv_b = up_f32(to_f32(B.qkv_b));
+            g.proj = up_b(B.proj_w); g.proj_b = up_f32(to_f32(B.proj_b));
+            g.fc1 = up_b(B.fc1_w); g.fc1_b = up_f32(to_f32(B.fc1_b));
+            g.fc2 = up_b(B.fc2_w); g.fc2_b = up_f32(to_f32(B.fc2_b));
+            VB_.push_back(g);
+        }
+        vmerge_nw_ = up_f32(to_f32(V.merge_norm_w));
+        vmerge_nb_ = up_f32(to_f32(V.merge_norm_b));
+        vmerge_fc1_ = up_b(V.merge_fc1_w);
+        vmerge_fc1_b_ = up_f32(to_f32(V.merge_fc1_b));
+        vmerge_fc2_ = up_b(V.merge_fc2_w);
+        vmerge_fc2_b_ = up_f32(to_f32(V.merge_fc2_b));
+        up_.flush();
+
+        const int64_t pp = (int64_t)vc.patch * vc.patch, unit = pp * vc.merge * vc.merge;
+        const int64_t max_px = std::max<int64_t>(opt_.image_max_pixels, vc.min_pixels);
+        vis_max_ = (int)((max_px / unit) * vc.merge * vc.merge);
+        const size_t N = (size_t)vis_max_, HD = VH / vc.heads;
+        auto act = [&](size_t floats) { return arena_.alloc(floats * 4); };
+        vx_ = act(N * VH);
+        vn_ = act(N * VH);
+        vqkv_ = act(N * 3 * VH);
+        vatt_ = act(N * VH);
+        vmlp_ = act(N * std::max<size_t>({(size_t)vc.inter, (size_t)PD, (size_t)M4 / 4}));  // fc1 out / patches / merger
+        vrope_ = act(N * HD);
+        vout_ = act(N / 4 * c_.hidden);
+        hvin_ = gpu_.create((VkDeviceSize)N * (PD + VH + HD) * 4, Mem::HostUpload);
+        hvout_ = gpu_.create((VkDeviceSize)N / 4 * c_.hidden * 4, Mem::HostRead);
+        size_t params = (size_t)VH * PD + (size_t)vc.n_pos * VH + (size_t)M4 * M4 + (size_t)c_.hidden * M4;
+        params += V.blocks.size() * ((size_t)4 * VH * VH + 2 * (size_t)VH * vc.inter);
+        std::fprintf(stderr, "[vulkan] vision tower: %d blocks, %.2f GB, images up to %d patches (%d tokens)\n", vc.depth,
+                     params * 2 / 1073741824.0, vis_max_, vis_max_ / 4);
+    }
+
+    void gemm_b(const GB& w, Ptr bias, Ptr x, uint32_t x_stride, Ptr y, uint32_t y_stride, int n, uint32_t act, bool accumulate) {
+        PcGemmB pc{w.w.addr(), bias.addr(), x.addr(), y.addr(), (uint32_t)w.rows, (uint32_t)w.cols, (uint32_t)n,
+                   x_stride, y_stride, act, accumulate ? 1u : 0u};
+        gpu_.dispatch("gemm_bf16", pc, groups(w.rows, 64), groups(n, 64));
+    }
+    void layer_norm(Ptr x, Ptr w, Ptr b, Ptr y, int dim, int n) {
+        PcLayerNorm pc{x.addr(), w.addr(), b.addr(), y.addr(), (uint32_t)dim, 1e-6f};
+        gpu_.dispatch("layer_norm", pc, n);
+    }
+
+    // Runs the tower on one image; the merged embeddings end up in hvout_.
+    void encode(const ImageInput& in) {
+        const Config::Vision& vc = c_.vis;
+        const int VH = vc.hidden, PD = vc.patch_dim(), HD = VH / vc.heads, M4 = VH * vc.merge * vc.merge;
+        const int N = in.gh * in.gw, T = N / (vc.merge * vc.merge);
+        uint8_t* h = hvin_->map;
+        const VkDeviceSize o_pos = (VkDeviceSize)N * PD * 4, o_rope = o_pos + (VkDeviceSize)N * VH * 4;
+        std::memcpy(h, in.patches.data(), (size_t)N * PD * 4);
+        std::memcpy(h + o_pos, in.pos.data(), (size_t)N * VH * 4);
+        std::memcpy(h + o_rope, in.rope.data(), (size_t)N * HD * 4);
+        gpu_.begin();
+        gpu_.copy(hvin_, 0, vmlp_.b, vmlp_.off, o_pos);
+        gpu_.copy(hvin_, o_pos, vx_.b, vx_.off, (VkDeviceSize)N * VH * 4);
+        gpu_.copy(hvin_, o_rope, vrope_.b, vrope_.off, (VkDeviceSize)N * HD * 4);
+        gpu_.barrier();
+        gemm_b(vpatch_w_, vpatch_b_, vmlp_, PD, vx_, VH, N, 0, true);  // x = pos + patch embedding
+        gpu_.barrier();
+        const PcVitRope pr{vqkv_.addr(), vrope_.addr(), (uint32_t)vc.heads, (uint32_t)VH};
+        const PcVitAttn pa{vqkv_.addr(), vatt_.addr(), (uint32_t)N, (uint32_t)vc.heads, 1.0f / std::sqrt((float)HD)};
+        for (const GVBlock& g : VB_) {
+            layer_norm(vx_, g.n1w, g.n1b, vn_, VH, N);
+            gpu_.barrier();
+            gemm_b(g.qkv, g.qkv_b, vn_, VH, vqkv_, 3 * VH, N, 0, false);
+            gpu_.barrier();
+            gpu_.dispatch("vit_rope", pr, N);
+            gpu_.barrier();
+            gpu_.dispatch("vit_attention", pa, groups(N, 64), vc.heads);
+            gpu_.barrier();
+            gemm_b(g.proj, g.proj_b, vatt_, VH, vx_, VH, N, 0, true);
+            gpu_.barrier();
+            layer_norm(vx_, g.n2w, g.n2b, vn_, VH, N);
+            gpu_.barrier();
+            gemm_b(g.fc1, g.fc1_b, vn_, VH, vmlp_, vc.inter, N, 1, false);
+            gpu_.barrier();
+            gemm_b(g.fc2, g.fc2_b, vmlp_, vc.inter, vx_, VH, N, 0, true);
+            gpu_.barrier();
+        }
+        // merger: LayerNorm per patch, then each 2x2 block (4 consecutive patches) as one row of 4 * hidden
+        layer_norm(vx_, vmerge_nw_, vmerge_nb_, vn_, VH, N);
+        gpu_.barrier();
+        gemm_b(vmerge_fc1_, vmerge_fc1_b_, vn_, M4, vmlp_, M4, T, 2, false);
+        gpu_.barrier();
+        gemm_b(vmerge_fc2_, vmerge_fc2_b_, vmlp_, M4, vout_, c_.hidden, T, 0, false);
+        gpu_.barrier();
+        gpu_.copy(vout_.b, vout_.off, hvout_, 0, (VkDeviceSize)T * c_.hidden * 4);
+        gpu_.barrier();
+        gpu_.submit_wait();
     }
 
     // ---- experts ------------------------------------------------------------------------------
@@ -922,6 +1128,19 @@ private:
         std::memcpy(d + off_sg_, ex.gate.scale, ex.gate.scale_count() * 2);
         std::memcpy(d + off_su_, ex.up.scale, ex.up.scale_count() * 2);
         std::memcpy(d + off_sd_, ex.down.scale, ex.down.scale_count() * 2);
+    }
+    // After the pinned copy is made, the mapped file pages it came from need not stay in our working set
+    // (they remain in the OS file cache); keeps the load-time peak near the pinned size.
+    static void release_source(const Expert& ex) {
+#ifdef _WIN32
+        for (const QMat* m : {&ex.gate, &ex.up, &ex.down}) {
+            const uintptr_t page = 4096, a = (uintptr_t)m->w & ~(page - 1);
+            const uintptr_t e = ((uintptr_t)m->w + m->weight_bytes()) & ~(page - 1);  // whole pages inside the tensor only
+            if (e > a) VirtualUnlock((LPVOID)a, e - a);
+        }
+#else
+        (void)ex;
+#endif
     }
 
     void setup_experts() {
@@ -941,7 +1160,7 @@ private:
         VkDeviceSize budget;
         if (opt_.expert_cache_mb) budget = (VkDeviceSize)opt_.expert_cache_mb << 20;
         else {
-            const VkDeviceSize free = gpu_.device_free(), margin = 1536ull << 20;  // driver / display headroom
+            const VkDeviceSize free = gpu_.device_free(), margin = (VkDeviceSize)opt_.vram_reserve_mb << 20;  // for other programs
             budget = free > margin ? free - margin : 0;
         }
         size_t want = std::min<size_t>(n_keys(), budget / slot_size_);
@@ -960,7 +1179,21 @@ private:
         if (!hybrid_) {
             // pinned host copies of every expert
             host_per_buf_ = CHUNK / slot_size_;
-            if (opt_.pin_experts) {
+            bool pin = opt_.pin_experts;
+#ifdef _WIN32
+            if (pin) {  // keep the RAM reserve: pinned memory cannot be paged out
+                MEMORYSTATUSEX ms{sizeof(ms)};
+                GlobalMemoryStatusEx(&ms);
+                const uint64_t need = (uint64_t)n_keys() * slot_size_, keep = (uint64_t)opt_.ram_reserve_mb << 20;
+                if (ms.ullAvailPhys < need + keep) {
+                    pin = false;
+                    std::fprintf(stderr, "[vulkan] not pinning %.1f GB of experts: %.1f GB of RAM is available and %.1f GB "
+                                         "must stay free (--ram-reserve); uncached experts run on the CPU instead\n",
+                                 need / 1073741824.0, ms.ullAvailPhys / 1073741824.0, keep / 1073741824.0);
+                }
+            }
+#endif
+            if (pin) {
                 const size_t nbuf = (n_keys() + host_per_buf_ - 1) / host_per_buf_;
                 pinned_ = true;
                 for (size_t i = 0; i < nbuf; i++) {
@@ -980,7 +1213,10 @@ private:
                     std::vector<std::thread> th;
                     for (int t = 0; t < nth; t++)
                         th.emplace_back([&, t] {
-                            for (size_t k = t; k < n_keys(); k += nth) write_expert(expert_of((int)k), host_bufs_[k / host_per_buf_]->map + (k % host_per_buf_) * slot_size_);
+                            for (size_t k = t; k < n_keys(); k += nth) {
+                                write_expert(expert_of((int)k), host_bufs_[k / host_per_buf_]->map + (k % host_per_buf_) * slot_size_);
+                                release_source(expert_of((int)k));
+                            }
                         });
                     for (auto& x : th) x.join();
                     std::fprintf(stderr, "[vulkan] pinned %zu experts (%.1f GB) in host memory in %.1fs\n", n_keys(),
@@ -1272,8 +1508,8 @@ private:
         gpu_.barrier();
         const uint64_t sel = c_.qwen4 ? indexer(l, n) : 0;
         PcQkRope pr{qg_.addr(), kb_.addr(), vb_.addr(), qo_.addr(), kcache_->addr + kv, vcache_->addr + kv,
-                    g.qn.addr(), g.kn.addr(), rope_.addr(), (uint32_t)pos_, (uint32_t)c_.n_heads,
-                    (uint32_t)c_.n_kv_heads, (uint32_t)c_.rope_dim, c_.rms_eps};
+                    g.qn.addr(), g.kn.addr(), rope_.addr(), pos3_, (uint32_t)pos_, (uint32_t)c_.n_heads,
+                    (uint32_t)c_.n_kv_heads, (uint32_t)c_.rope_dim, c_.rms_eps, rope_delta_};
         gpu_.dispatch("qk_norm_rope", pr, n, c_.n_heads + c_.n_kv_heads);
         gpu_.barrier();
         // split-K over keys: many splits when few tokens (decode), few when the batch is already wide
@@ -1479,14 +1715,25 @@ private:
         gpu_.barrier();
     }
 
-    void forward_chunk(const int* tokens, int n, float* logits) {
+    // `embeds` (image tokens) replaces the token embeddings, with per-token rotary positions `pos3`.
+    void forward_chunk(const int* tokens, int n, float* logits, const float* embeds = nullptr, const uint32_t* pos3 = nullptr) {
         const int H = c_.hidden, S = c_.hc;
         float* hx = (float*)hx_->map;
         for (int t = 0; t < n; t++) {  // qwen4: every stream starts as the embedding
-            const uint16_t* e = w_.embed.w + (size_t)tokens[t] * H;
-            for (int i = 0; i < H; i++) hx[(size_t)t * HH_ + i] = bf16_to_f32(e[i]);
+            if (embeds) {
+                std::memcpy(&hx[(size_t)t * HH_], embeds + (size_t)t * H, (size_t)H * 4);
+            } else {
+                const uint16_t* e = w_.embed.w + (size_t)tokens[t] * H;
+                for (int i = 0; i < H; i++) hx[(size_t)t * HH_ + i] = bf16_to_f32(e[i]);
+            }
             for (int s = 1; s < S; s++) std::memcpy(&hx[(size_t)t * HH_ + s * H], &hx[(size_t)t * HH_], H * 4);
         }
+        pos3_ = 0;
+        if (pos3) {
+            std::memcpy(hpos3_->map, pos3, (size_t)n * 3 * 4);
+            pos3_ = hpos3_->addr;
+        }
+        if (hemb_ && !tokens) throw std::runtime_error("image input is not supported for this model");
         if (hemb_) {
             ck::ple_embed(*ple_pool_, c_, w_.ple, hist_, tokens, n, (float*)hemb_->map);
             const int C = (int)hist_.size();

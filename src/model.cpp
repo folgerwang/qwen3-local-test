@@ -68,6 +68,47 @@ Config Config::load(const std::string& dir) {
         if (t["indexer_kv_heads"].as_int() != 1) throw std::runtime_error("unsupported indexer_kv_heads");
     }
 
+    // vision tower (not wired up for qwen4_exp yet)
+    if (const json::Value* v = root.find("vision_config"); v && !c.qwen4) {
+        Config::Vision& vc = c.vis;
+        vc.depth = (int)v->get_int("depth", 0);
+        vc.hidden = (int)(*v)["hidden_size"].as_int();
+        vc.heads = (int)(*v)["num_heads"].as_int();
+        vc.inter = (int)(*v)["intermediate_size"].as_int();
+        vc.patch = (int)(*v)["patch_size"].as_int();
+        vc.temporal = (int)v->get_int("temporal_patch_size", 2);
+        vc.merge = (int)v->get_int("spatial_merge_size", 2);
+        vc.n_pos = (int)(*v)["num_position_embeddings"].as_int();
+        vc.out = (int)(*v)["out_hidden_size"].as_int();
+        if (const json::Value* rp = v->find("rope_parameters")) vc.rope_theta = (float)rp->get_num("rope_theta", 10000.0);
+        vc.image_token = (int)root.get_int("image_token_id", -1);
+        vc.vision_start = (int)root.get_int("vision_start_token_id", -1);
+        vc.vision_end = (int)root.get_int("vision_end_token_id", -1);
+        const json::Value* ds = v->find("deepstack_visual_indexes");
+        const int hd = vc.heads ? vc.hidden / vc.heads : 0, side = (int)std::lround(std::sqrt((double)vc.n_pos));
+        // image tokens use interleaved M-RoPE; the shader maps rotary frequency i to position component i % 3,
+        // which is exactly the [11, 11, 10] interleaved split of the 32 frequencies
+        bool mrope_ok = false;
+        if (rp && rp->find("mrope_section")) {
+            const auto& s = (*rp)["mrope_section"].arr;
+            const json::Value* il = rp->find("mrope_interleaved");
+            mrope_ok = il && il->b && s.size() == 3 && s[0].as_int() == 11 && s[1].as_int() == 11 && s[2].as_int() == 10 &&
+                       c.rope_dim == 64;
+        }
+        if (vc.out != c.hidden || (ds && !ds->arr.empty()) || vc.image_token < 0 || hd != 72 || vc.hidden % 64 ||
+            vc.inter % 16 || side * side != vc.n_pos || vc.merge != 2 || !mrope_ok)
+            vc.depth = 0;  // a layout this engine does not implement: text only
+        try {
+            json::Value pp = json::parse(read_file(dir + "/preprocessor_config.json"));
+            if (const json::Value* m = pp.find("image_mean"))
+                for (int i = 0; i < 3; i++) vc.mean[i] = (float)m->arr.at(i).as_num();
+            if (const json::Value* s = pp.find("image_std"))
+                for (int i = 0; i < 3; i++) vc.std[i] = (float)s->arr.at(i).as_num();
+            if (const json::Value* sz = pp.find("size")) vc.min_pixels = sz->get_int("shortest_edge", vc.min_pixels);
+        } catch (...) {
+        }
+    }
+
     // eos ids: generation_config.json has the full list (<|im_end|>, <|endoftext|>).
     try {
         json::Value g = json::parse(read_file(dir + "/generation_config.json"));
@@ -238,6 +279,39 @@ void ModelWeights::load(const SafeTensors& st, const Config& c) {
             L.experts[e] = {qmat(st, ep + "gate_proj", c.moe_inter, H), qmat(st, ep + "up_proj", c.moe_inter, H),
                             qmat(st, ep + "down_proj", H, c.moe_inter)};
         }
+    }
+
+    // vision tower, when the config describes one and the checkpoint has it
+    const Config::Vision& vc = c.vis;
+    const std::string v = "model.visual.";
+    if (vc.depth && st.find(v + "patch_embed.proj.weight")) {
+        const int VH = vc.hidden, M4 = VH * vc.merge * vc.merge;
+        vis.patch_w = bmat(st, v + "patch_embed.proj.weight", VH, vc.patch_dim());
+        vis.patch_b = bmat(st, v + "patch_embed.proj.bias", 1, VH);
+        vis.pos_embed = bmat(st, v + "pos_embed.weight", vc.n_pos, VH);
+        vis.blocks.resize(vc.depth);
+        for (int b = 0; b < vc.depth; b++) {
+            const std::string bp = v + "blocks." + std::to_string(b) + ".";
+            VisionBlock& B = vis.blocks[b];
+            B.norm1_w = bmat(st, bp + "norm1.weight", 1, VH);
+            B.norm1_b = bmat(st, bp + "norm1.bias", 1, VH);
+            B.qkv_w = bmat(st, bp + "attn.qkv.weight", 3 * VH, VH);
+            B.qkv_b = bmat(st, bp + "attn.qkv.bias", 1, 3 * VH);
+            B.proj_w = bmat(st, bp + "attn.proj.weight", VH, VH);
+            B.proj_b = bmat(st, bp + "attn.proj.bias", 1, VH);
+            B.norm2_w = bmat(st, bp + "norm2.weight", 1, VH);
+            B.norm2_b = bmat(st, bp + "norm2.bias", 1, VH);
+            B.fc1_w = bmat(st, bp + "mlp.linear_fc1.weight", vc.inter, VH);
+            B.fc1_b = bmat(st, bp + "mlp.linear_fc1.bias", 1, vc.inter);
+            B.fc2_w = bmat(st, bp + "mlp.linear_fc2.weight", VH, vc.inter);
+            B.fc2_b = bmat(st, bp + "mlp.linear_fc2.bias", 1, VH);
+        }
+        vis.merge_norm_w = bmat(st, v + "merger.norm.weight", 1, VH);
+        vis.merge_norm_b = bmat(st, v + "merger.norm.bias", 1, VH);
+        vis.merge_fc1_w = bmat(st, v + "merger.linear_fc1.weight", M4, M4);
+        vis.merge_fc1_b = bmat(st, v + "merger.linear_fc1.bias", 1, M4);
+        vis.merge_fc2_w = bmat(st, v + "merger.linear_fc2.weight", vc.out, M4);
+        vis.merge_fc2_b = bmat(st, v + "merger.linear_fc2.bias", 1, vc.out);
     }
 }
 

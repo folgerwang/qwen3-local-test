@@ -47,6 +47,23 @@ struct Config {
     int idx_dim = 0;           // 128
     int idx_budget = 0;        // 2048 tokens
     int idx_ratio = 0;         // 4 tokens per pooled key block
+    // vision tower (Qwen3.5/3.6 checkpoints): ViT over 16x16 patches, 2x2 patch merge into the text model
+    struct Vision {
+        int depth = 0;             // 27 blocks (0 = no vision tower)
+        int hidden = 0;            // 1152
+        int heads = 0;             // 16 (head_dim 72)
+        int inter = 0;             // 4304
+        int patch = 0;             // 16
+        int temporal = 0;          // 2 (an image is two identical frames)
+        int merge = 0;             // 2
+        int n_pos = 0;             // 2304 learned positions (48 x 48 grid)
+        int out = 0;               // = text hidden size
+        float rope_theta = 10000.0f;
+        float mean[3] = {0.5f, 0.5f, 0.5f}, std[3] = {0.5f, 0.5f, 0.5f};
+        int64_t min_pixels = 65536;
+        int image_token = -1, vision_start = -1, vision_end = -1;
+        int patch_dim() const { return 3 * temporal * patch * patch; }
+    } vis;
 
     int lin_key_dim() const { return lin_k_heads * lin_k_dim; }
     int lin_value_dim() const { return lin_v_heads * lin_v_dim; }
@@ -119,11 +136,23 @@ struct LayerWeights {
     HyperConn attn_hc, mlp_hc;  // qwen4
 };
 
+// Vision tower: all BF16, linear layers have biases, norms are LayerNorm (weight + bias).
+struct VisionBlock {
+    BMat norm1_w, norm1_b, qkv_w, qkv_b, proj_w, proj_b, norm2_w, norm2_b, fc1_w, fc1_b, fc2_w, fc2_b;
+};
+struct VisionWeights {
+    BMat patch_w, patch_b;  // Conv3d [hidden, 3, temporal, patch, patch] seen as [hidden, patch_dim]
+    BMat pos_embed;         // [n_pos, hidden]
+    std::vector<VisionBlock> blocks;
+    BMat merge_norm_w, merge_norm_b, merge_fc1_w, merge_fc1_b, merge_fc2_w, merge_fc2_b;
+};
+
 struct ModelWeights {
     BMat embed, lm_head, final_norm;
     std::vector<LayerWeights> layers;
     HyperConn mixer;  // qwen4: folds the streams back into one before lm_head (replaces final_norm)
     Ple ple;
+    VisionWeights vis;  // empty unless cfg.vis.depth
     void load(const SafeTensors& st, const Config& cfg);
 };
 
