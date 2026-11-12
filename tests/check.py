@@ -1,4 +1,5 @@
-# Runs qwen.exe --eval for each backend / prompt / split and compares top-10 logits to the fp32 reference.
+# Runs qwen.exe --eval for each backend / prompt / split and compares top-10 logits to the fp32 reference
+# (Qwen3.6-35B-A3B FP8; the GGUF model has its own check: tests/check_gguf.py).
 import os, subprocess, sys
 exe = os.path.abspath("build/Release/qwen.exe")
 backends = sys.argv[1].split(",") if len(sys.argv) > 1 else ["cpu", "vulkan"]
@@ -11,7 +12,7 @@ for be in backends:
         ref = [(int(a), float(b)) for a, b in (l.split() for l in open(ref_f) if l.strip())]
         ids = open(ids_f).read().strip()
         for sp in splits:
-            r = subprocess.run([exe, "--backend", be, "--eval", ids, "--eval-split", str(sp), "--ctx", "2048"],
+            r = subprocess.run([exe, "--model", "models/Qwen3.6-35B-A3B-FP8", "--backend", be, "--eval", ids, "--eval-split", str(sp), "--ctx", "2048"],
                                capture_output=True, text=True)
             got = [(int(a), float(b)) for a, b in (l.split() for l in r.stdout.splitlines() if l.strip())]
             if len(got) != 10:

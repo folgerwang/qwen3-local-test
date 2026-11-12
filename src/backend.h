@@ -25,6 +25,8 @@ public:
 std::unique_ptr<Backend> make_cpu_backend(const Config& cfg, const ModelWeights& w, int max_ctx, int threads);
 struct VulkanOptions {
     size_t expert_cache_mb = 0;  // 0 = auto (all free VRAM minus a margin)
+    int threads = 0;             // GGUF backend: CPU threads for the experts computed from RAM (0 = auto)
+    bool expert_cache_set = false;  // GGUF backend: expert_cache_mb was given (0 = no VRAM cache)
     std::string stats_path;      // expert usage counts, loaded for preload and updated on exit ("" = off)
     bool pin_experts = true;     // keep all experts in pinned host memory the GPU reads directly on a miss
     int hybrid = -1;             // CPU computes cache misses: -1 auto (only if pinning fails), 0 off, 1 on

@@ -13,7 +13,11 @@ add_executable(qwen
     src/safetensors.cpp
     src/tokenizer.cpp
     src/cpu_backend.cpp
-    src/cpu_kernels.cpp)
+    src/cpu_kernels.cpp
+    src/gguf.cpp
+    src/quant.cpp
+    src/qwen4.cpp
+    src/qwen4_cpu.cpp)
 
 if(MSVC)
     target_compile_options(qwen PRIVATE /O2 /utf-8 /W3 /bigobj /fp:fast)
@@ -56,7 +60,39 @@ if(QW_VULKAN)
         "gemm_coop|gemm_coop.comp|"
         "gemm_coop_swiglu|gemm_coop.comp|-DSWIGLU"
         "gemm_coop_expert|gemm_coop.comp|-DEXPERT"
-        "gemm_coop_expert_swiglu|gemm_coop.comp|-DEXPERT -DSWIGLU")
+        "gemm_coop_expert_swiglu|gemm_coop.comp|-DEXPERT -DSWIGLU"
+        # qwen4exp (GGUF quantization codecs, hyper-connections, PLE, QSA)
+        "q4_matmul_q8|q4_matmul.comp|-DC_Q8"
+        "q4_matmul_q8_swiglu|q4_matmul.comp|-DC_Q8 -DSWIGLU"
+        "q4_matmul_f32|q4_matmul.comp|-DC_F32"
+        "q4_matmul_f32_swiglu|q4_matmul.comp|-DC_F32 -DSWIGLU"
+        "q4_expert_q4k_swiglu|q4_matmul.comp|-DC_Q4K -DEXPERT -DSWIGLU"
+        "q4_expert_q5k_swiglu|q4_matmul.comp|-DC_Q5K -DEXPERT -DSWIGLU"
+        "q4_expert_q8_swiglu|q4_matmul.comp|-DC_Q8 -DEXPERT -DSWIGLU"
+        "q4_expert_q51|q4_matmul.comp|-DC_Q51 -DEXPERT"
+        "q4_expert_q8|q4_matmul.comp|-DC_Q8 -DEXPERT"
+        "q4_expert_q4k|q4_matmul.comp|-DC_Q4K -DEXPERT"
+        "q4_expert_q5k|q4_matmul.comp|-DC_Q5K -DEXPERT"
+        "q4_gemm_q8|q4_gemm.comp|-DC_Q8"
+        "q4_gemm_q8_swiglu|q4_gemm.comp|-DC_Q8 -DSWIGLU"
+        "q4_gemm_f32|q4_gemm.comp|-DC_F32"
+        "q4_gemm_f32_swiglu|q4_gemm.comp|-DC_F32 -DSWIGLU"
+        "q4_gemm_expert_q4k_swiglu|q4_gemm.comp|-DC_Q4K -DEXPERT -DSWIGLU"
+        "q4_gemm_expert_q5k_swiglu|q4_gemm.comp|-DC_Q5K -DEXPERT -DSWIGLU"
+        "q4_gemm_expert_q8_swiglu|q4_gemm.comp|-DC_Q8 -DEXPERT -DSWIGLU"
+        "q4_gemm_expert_q51|q4_gemm.comp|-DC_Q51 -DEXPERT"
+        "q4_gemm_expert_q8|q4_gemm.comp|-DC_Q8 -DEXPERT"
+        "q4_gemm_expert_q4k|q4_gemm.comp|-DC_Q4K -DEXPERT"
+        "q4_gemm_expert_q5k|q4_gemm.comp|-DC_Q5K -DEXPERT"
+        "q4_hc_norm|q4_hc.comp|-DHC_NORM"
+        "q4_hc_mix|q4_hc.comp|-DHC_MIX"
+        "q4_hc_combine|q4_hc.comp|-DHC_COMBINE"
+        "q4_ple_gate|q4_ple.comp|-DPLE_GATE"
+        "q4_ple_conv|q4_ple.comp|-DPLE_CONV"
+        "gated_norm_sigmoid|gated_norm.comp|-DGATE_SIGMOID"
+        "deltanet_tiled|deltanet.comp|-DV_TILED"
+        "moe_combine_set|moe_combine.comp|-DASSIGN"
+        "attention_qsa|attention.comp|-DQSA")
     set(spv_files "")
     set(spv_args "")
     file(GLOB shader_deps ${CMAKE_SOURCE_DIR}/shaders/*)
@@ -80,7 +116,7 @@ if(QW_VULKAN)
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/gen
         COMMAND ${CMAKE_COMMAND} -DOUT=${CMAKE_BINARY_DIR}/gen/shaders_spv.h -DLIST=${CMAKE_BINARY_DIR}/spv_list.txt -P ${CMAKE_SOURCE_DIR}/cmake/embed_spv.cmake
         DEPENDS ${spv_files} ${CMAKE_SOURCE_DIR}/cmake/embed_spv.cmake VERBATIM)
-    target_sources(qwen PRIVATE src/vk_backend.cpp ${CMAKE_BINARY_DIR}/gen/shaders_spv.h)
+    target_sources(qwen PRIVATE src/vk_backend.cpp src/qwen4_vk.cpp ${CMAKE_BINARY_DIR}/gen/shaders_spv.h)
     target_include_directories(qwen PRIVATE ${CMAKE_BINARY_DIR}/gen)
     target_compile_definitions(qwen PRIVATE QW_VULKAN=1)
     target_link_libraries(qwen PRIVATE Vulkan::Vulkan)

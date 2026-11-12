@@ -1,0 +1,48 @@
+// Hyper-connection steps over the residual streams x[n][hc][dim] (one pipeline per step):
+//   HC_NORM     out[t][s] = rmsnorm(x[t][s]) * w[s]               workgroup = (token, stream)
+//   HC_MIX      out[t]    = mean_s xnorm[t][s] * sigmoid(gate[t][s])   thread = (dim, token)
+//   HC_COMBINE  x[t][s]  += 2 * sigmoid(inj[t][s] / hc) * blk[t]       thread = (dim, token)
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t a, b, c;  // NORM: x, w, out | MIX: xnorm, gate, out | COMBINE: x, inj, blk
+    uint dim, hc;
+    float eps;
+} pc;
+
+#ifdef HC_NORM
+shared float red[8];
+#endif
+
+void main() {
+#if defined(HC_NORM)
+    const uint t = gl_WorkGroupID.x, s = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+    F32 x = F32(pc.a + uint64_t(t * pc.hc + s) * pc.dim * 4u);
+    float ss = 0.0;
+    for (uint i = tid; i < pc.dim; i += 256u) ss += x.v[i] * x.v[i];
+    ss = subgroupAdd(ss);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = ss;
+    barrier();
+    float tot = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; i++) tot += red[i];
+    const float r = inversesqrt(tot / float(pc.dim) + pc.eps);
+    F32 o = F32(pc.c + uint64_t(t * pc.hc + s) * pc.dim * 4u), w = F32(pc.b + uint64_t(s) * pc.dim * 4u);
+    for (uint i = tid; i < pc.dim; i += 256u) o.v[i] = x.v[i] * r * w.v[i];
+#elif defined(HC_MIX)
+    const uint d = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
+    if (d >= pc.dim) return;
+    F32 xs = F32(pc.a + uint64_t(t) * pc.hc * pc.dim * 4u), g = F32(pc.b + uint64_t(t) * pc.hc * pc.dim * 4u);
+    float acc = 0.0;
+    for (uint s = 0; s < pc.hc; s++) acc += xs.v[s * pc.dim + d] * sigmoid(g.v[s * pc.dim + d]);
+    F32(pc.c).v[t * pc.dim + d] = acc / float(pc.hc);
+#else
+    const uint d = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
+    if (d >= pc.dim) return;
+    F32 x = F32(pc.a + uint64_t(t) * pc.hc * pc.dim * 4u);
+    const float blk = F32(pc.c).v[t * pc.dim + d];
+    for (uint s = 0; s < pc.hc; s++)
+        x.v[s * pc.dim + d] += 2.0 * sigmoid(F32(pc.b).v[t * pc.hc + s] / float(pc.hc)) * blk;
+#endif
+}

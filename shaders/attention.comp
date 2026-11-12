@@ -1,6 +1,8 @@
 // Split-K causal GQA attention, head_dim 256. Workgroup = (token, head, key split). 8 subgroups each
 // stream a strided subset of the split's keys with an online softmax (lanes hold 8 dims each); the
 // workgroup then merges them and writes an unnormalized partial (max m, sum l, o[256]) for attn_combine.
+// QSA: token t only attends to the blocks of `cr` keys whose bit is set in mask[t][mask_words] and to the
+// incomplete tail block (keys from (len / cr) * cr on).
 #version 460
 #include "common.glsl"
 
@@ -11,6 +13,10 @@ layout(push_constant) uniform PC {
     uint64_t q, kcache, vcache, part;
     uint pos, n_heads, n_kv, chunk, n_split;
     float scale;
+#ifdef QSA
+    uint64_t mask;
+    uint cr, mask_words;
+#endif
 } pc;
 
 shared float sm[8], sl[8];
@@ -25,7 +31,15 @@ void main() {
     const vec4 qa = q4.v[lane * 2u] * pc.scale, qb = q4.v[lane * 2u + 1u] * pc.scale;
     float m = -1e30, l = 0.0;
     vec4 oa = vec4(0.0), ob = vec4(0.0);
+#ifdef QSA
+    U32 mask = U32(pc.mask + uint64_t(t) * pc.mask_words * 4u);
+    const uint tail = (len / pc.cr) * pc.cr;
+#endif
     for (uint j = jb + sg; j < je; j += 8u) {
+#ifdef QSA
+        const uint blk = j / pc.cr;
+        if (j < tail && (mask.v[blk >> 5] & (1u << (blk & 31u))) == 0u) continue;
+#endif
         const uint64_t off = uint64_t((j * pc.n_kv + kvh) * D) * 4u;
         F4 k4 = F4(pc.kcache + off), v4 = F4(pc.vcache + off);
         const float s = subgroupAdd(dot(qa, k4.v[lane * 2u]) + dot(qb, k4.v[lane * 2u + 1u]));

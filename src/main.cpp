@@ -1,4 +1,5 @@
-// qwen: local inference for Qwen3.5/3.6 MoE (FP8) with CPU and Vulkan backends.
+// qwen: local inference for Qwen MoE models with CPU and Vulkan backends: Qwen3.8-Flash-Next from a GGUF
+// (UD-Q4_K_XL by default) and Qwen3.5/3.6 from FP8 safetensors.
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -13,8 +14,10 @@
 #include <vector>
 
 #include "backend.h"
+#include "gguf.h"
 #include "json.h"
 #include "model.h"
+#include "qwen4.h"
 #include "safetensors.h"
 #include "tokenizer.h"
 
@@ -27,7 +30,7 @@
 namespace {
 
 struct Options {
-    std::string model_dir = "models/Qwen3.6-35B-A3B-FP8";
+    std::string model_dir = "models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL";
     std::string backend = "cpu";
     std::string prompt;
     std::string system;
@@ -39,6 +42,7 @@ struct Options {
     int max_new = 4096;
     int threads = 0;
     size_t expert_cache_mb = 0;  // 0 = auto
+    bool expert_cache_set = false;
     float temperature = 1.0f, top_p = 0.95f;
     int top_k = 20;
     uint64_t seed = 0;
@@ -47,6 +51,7 @@ struct Options {
     bool no_pin = false;
     int hybrid = -1;
     bool keep_think = false;
+    bool drop_think = false;
     bool hide_think = false;
     bool no_stats = false;
 };
@@ -54,14 +59,17 @@ struct Options {
 void usage() {
     std::printf(
         "usage: qwen [options]\n"
-        "  --model DIR          model directory (default models/Qwen3.6-35B-A3B-FP8)\n"
+        "  --model PATH         directory of *.gguf shards (or one .gguf file), or an FP8 safetensors model\n"
+        "                       directory (default models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL)\n"
         "  --backend cpu|vulkan inference backend (default cpu)\n"
         "  -p, --prompt TEXT    single prompt, then exit (otherwise interactive chat)\n"
         "  -f, --prompt-file F  read the single prompt from a file\n"
         "  --system TEXT        system prompt\n"
         "  --no-think           disable thinking mode\n"
         "  --hide-think         don't print the reasoning, show thinking... (a dot every 2s) instead (/think toggles)\n"
-        "  --keep-think         keep earlier turns' reasoning in the history (default: drop, like the template)\n"
+        "  --keep-think         keep earlier turns' reasoning in the history\n"
+        "  --drop-think         drop it (default: what the model's chat template does: keep for\n"
+        "                       Qwen3.8-Flash-Next, drop for Qwen3.5/3.6)\n"
         "  -n N                 max new tokens per reply (default 4096)\n"
         "  --ctx N              context length (default 32768)\n"
         "  --temp T --top-k K --top-p P --seed S --greedy\n"
@@ -178,6 +186,7 @@ int main(int argc, char** argv) {
         else if (a == "--system") o.system = next();
         else if (a == "--no-think") o.think = false;
         else if (a == "--keep-think") o.keep_think = true;
+        else if (a == "--drop-think") o.drop_think = true;
         else if (a == "--hide-think") o.hide_think = true;
         else if (a == "-n") o.max_new = std::stoi(next());
         else if (a == "--ctx") o.max_ctx = std::stoi(next());
@@ -187,7 +196,7 @@ int main(int argc, char** argv) {
         else if (a == "--seed") o.seed = std::stoull(next());
         else if (a == "--greedy") o.greedy = true;
         else if (a == "--threads") o.threads = std::stoi(next());
-        else if (a == "--expert-cache") o.expert_cache_mb = std::stoull(next());
+        else if (a == "--expert-cache") { o.expert_cache_mb = std::stoull(next()); o.expert_cache_set = true; }
         else if (a == "--no-pin") o.no_pin = true;
         else if (a == "--hybrid") o.hybrid = 1;
         else if (a == "--no-hybrid") o.hybrid = 0;
@@ -201,8 +210,19 @@ int main(int argc, char** argv) {
     }
 
     try {
+        // A GGUF (file or directory of shards) selects the qwen4exp path; otherwise FP8 safetensors.
+        std::unique_ptr<Gguf> gguf;
+        if (Gguf::is_gguf_path(o.model_dir)) gguf = std::make_unique<Gguf>(o.model_dir);
+        const std::string state_dir = gguf ? gguf->dir() : o.model_dir;
+        // The Qwen3.8 chat template renders earlier assistant turns with their reasoning (preserve_thinking).
+        if (gguf) o.keep_think = true;
+        if (o.drop_think) o.keep_think = false;
         Tokenizer tok;
-        tok.load(o.model_dir);
+        if (gguf)
+            tok.load_gguf(gguf->kv("tokenizer.ggml.tokens").strs, gguf->kv("tokenizer.ggml.token_type").ints,
+                          gguf->kv("tokenizer.ggml.merges").strs);
+        else
+            tok.load(o.model_dir);
         if (!o.tokenize.empty()) {
             for (int id : tok.encode(o.tokenize)) std::printf("%d ", id);
             std::printf("\n");
@@ -219,26 +239,54 @@ int main(int argc, char** argv) {
         }
 
         auto t0 = std::chrono::steady_clock::now();
-        Config cfg = Config::load(o.model_dir);
-        SafeTensors st(o.model_dir);
-        ModelWeights w;
-        w.load(st, cfg);
+        // The configs and weight views must outlive the backend, which keeps references to them.
+        Config fcfg;
+        ModelWeights fw;
+        std::unique_ptr<SafeTensors> st;
+        Q4Config qcfg;
+        Q4Weights qw;
+        struct { int vocab = 0, n_layers = 0; size_t n_tensors = 0; std::vector<int> eos_ids; } cfg;
         std::unique_ptr<Backend> be;
-        if (o.backend == "cpu") be = make_cpu_backend(cfg, w, o.max_ctx, o.threads);
+        if (gguf) {
+            gguf->check_complete();
+            qcfg = Q4Config::load(*gguf);
+            qw.load(*gguf, qcfg);
+            cfg = {qcfg.vocab, qcfg.n_layers, gguf->count(), qcfg.eos_ids};
+            if (o.backend == "cpu") be = make_qwen4_cpu_backend(qcfg, qw, o.max_ctx, o.threads);
 #ifdef QW_VULKAN
-        else if (o.backend == "vulkan" || o.backend == "vk") {
-            VulkanOptions vo;
-            vo.expert_cache_mb = o.expert_cache_mb;
-            vo.stats_path = o.no_stats ? "" : o.model_dir + "/expert_usage.bin";
-            vo.pin_experts = !o.no_pin;
-            vo.hybrid = o.hybrid;
-            be = make_vulkan_backend(cfg, w, o.max_ctx, vo);
-        }
+            else if (o.backend == "vulkan" || o.backend == "vk") {
+                VulkanOptions vo;
+                vo.expert_cache_mb = o.expert_cache_mb;
+                vo.stats_path = o.no_stats ? "" : state_dir + "/expert_usage.bin";
+                vo.pin_experts = !o.no_pin;
+                vo.hybrid = o.hybrid;
+                vo.expert_cache_set = o.expert_cache_set;
+                vo.threads = o.threads;
+                be = make_qwen4_vulkan_backend(qcfg, qw, o.max_ctx, vo);
+            }
 #endif
-        else throw std::runtime_error("unknown/unavailable backend: " + o.backend);
+            else throw std::runtime_error("unknown/unavailable backend: " + o.backend);
+        } else {
+            fcfg = Config::load(o.model_dir);
+            st = std::make_unique<SafeTensors>(o.model_dir);
+            fw.load(*st, fcfg);
+            cfg = {fcfg.vocab, fcfg.n_layers, st->count(), fcfg.eos_ids};
+            if (o.backend == "cpu") be = make_cpu_backend(fcfg, fw, o.max_ctx, o.threads);
+#ifdef QW_VULKAN
+            else if (o.backend == "vulkan" || o.backend == "vk") {
+                VulkanOptions vo;
+                vo.expert_cache_mb = o.expert_cache_mb;
+                vo.stats_path = o.no_stats ? "" : state_dir + "/expert_usage.bin";
+                vo.pin_experts = !o.no_pin;
+                vo.hybrid = o.hybrid;
+                be = make_vulkan_backend(fcfg, fw, o.max_ctx, vo);
+            }
+#endif
+            else throw std::runtime_error("unknown/unavailable backend: " + o.backend);
+        }
         double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "[%s backend, %d layers, %zu tensors, ready in %.1fs]\n", be->name(), cfg.n_layers,
-                     st.count(), load_s);
+                     cfg.n_tensors, load_s);
 
         std::vector<float> logits(cfg.vocab);
 

@@ -1,4 +1,5 @@
 // Per (token, head): o = rmsnorm(o) * w * silu(z), in place. 128 threads = head dim.
+// GATE_SIGMOID: the gate is sigmoid(z) instead (qwen4exp).
 #version 460
 #include "common.glsl"
 
@@ -21,5 +22,10 @@ void main() {
     barrier();
     float tot = 0.0;
     for (uint i = 0; i < gl_NumSubgroups; i++) tot += red[i];
-    o.v[idx] = v * inversesqrt(tot / 128.0 + pc.eps) * F32(pc.w).v[tid] * silu(F32(pc.z).v[idx]);
+#ifdef GATE_SIGMOID
+    const float g = sigmoid(F32(pc.z).v[idx]);
+#else
+    const float g = silu(F32(pc.z).v[idx]);
+#endif
+    o.v[idx] = v * inversesqrt(tot / 128.0 + pc.eps) * F32(pc.w).v[tid] * g;
 }

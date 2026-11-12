@@ -231,7 +231,7 @@ static std::string read_file(const std::string& path) {
     return ss.str();
 }
 
-void Tokenizer::load(const std::string& dir) {
+std::vector<uint32_t> Tokenizer::init_byte_map() {
     // GPT-2 byte <-> unicode mapping
     std::vector<uint32_t> unicode_to_byte(512, 0xFFFF);
     int extra = 0;
@@ -242,6 +242,45 @@ void Tokenizer::load(const std::string& dir) {
         utf8_append(byte_to_unicode_[b], cp);
         unicode_to_byte[cp] = (uint32_t)b;
     }
+    return unicode_to_byte;
+}
+
+// Byte-level token text -> raw bytes.
+static std::string token_bytes(const std::string& tok, const std::vector<uint32_t>& unicode_to_byte) {
+    std::string bytes;
+    for (uint32_t cp : utf8_decode(tok)) bytes += (char)(cp < 512 && unicode_to_byte[cp] != 0xFFFF ? unicode_to_byte[cp] : '?');
+    return bytes;
+}
+
+void Tokenizer::add_merge(const std::string& a, const std::string& b, int rank) {
+    auto ia = vocab_.find(a), ib = vocab_.find(b), ic = vocab_.find(a + b);
+    if (ia != vocab_.end() && ib != vocab_.end() && ic != vocab_.end())
+        merges_[((uint64_t)ia->second << 32) | (uint32_t)ib->second] = {rank, ic->second};
+}
+
+void Tokenizer::load_gguf(const std::vector<std::string>& tokens, const std::vector<uint64_t>& types,
+                          const std::vector<std::string>& merges) {
+    const std::vector<uint32_t> unicode_to_byte = init_byte_map();
+    id_to_token_.resize(tokens.size());
+    for (size_t i = 0; i < tokens.size(); i++) {
+        vocab_[tokens[i]] = (int)i;
+        // type 1 = normal byte-level token; control / user-defined tokens are literal text
+        if (i < types.size() && types[i] != 1) {
+            id_to_token_[i] = tokens[i];
+            added_.push_back({tokens[i], (int)i});
+        } else {
+            id_to_token_[i] = token_bytes(tokens[i], unicode_to_byte);
+        }
+    }
+    for (size_t r = 0; r < merges.size(); r++) {
+        const size_t sp = merges[r].find(' ');
+        if (sp != std::string::npos) add_merge(merges[r].substr(0, sp), merges[r].substr(sp + 1), (int)r);
+    }
+    std::sort(added_.begin(), added_.end(), [](auto& x, auto& y) { return x.first.size() > y.first.size(); });
+}
+
+void Tokenizer::load(const std::string& dir) {
+    const std::vector<uint32_t> unicode_to_byte = init_byte_map();
 
     json::Value t = json::parse(read_file(dir + "/tokenizer.json"));
     const json::Value& model = t["model"];
@@ -249,24 +288,16 @@ void Tokenizer::load(const std::string& dir) {
         int i = (int)id.as_int();
         vocab_[tok] = i;
         if ((int)id_to_token_.size() <= i) id_to_token_.resize(i + 1);
-        std::string bytes;
-        for (uint32_t cp : utf8_decode(tok)) bytes += (char)(cp < 512 && unicode_to_byte[cp] != 0xFFFF ? unicode_to_byte[cp] : '?');
-        id_to_token_[i] = bytes;
+        id_to_token_[i] = token_bytes(tok, unicode_to_byte);
     }
     int rank = 0;
     for (auto& m : model["merges"].arr) {
-        std::string a, b;
         if (m.type == json::Value::String) {
             size_t sp = m.as_str().find(' ');
-            a = m.as_str().substr(0, sp);
-            b = m.as_str().substr(sp + 1);
+            add_merge(m.as_str().substr(0, sp), m.as_str().substr(sp + 1), rank);
         } else {
-            a = m[0].as_str();
-            b = m[1].as_str();
+            add_merge(m[0].as_str(), m[1].as_str(), rank);
         }
-        auto ia = vocab_.find(a), ib = vocab_.find(b), ic = vocab_.find(a + b);
-        if (ia != vocab_.end() && ib != vocab_.end() && ic != vocab_.end())
-            merges_[((uint64_t)ia->second << 32) | (uint32_t)ib->second] = {rank, ic->second};
         rank++;
     }
     for (auto& a : t["added_tokens"].arr) {

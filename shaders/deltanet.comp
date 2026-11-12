@@ -1,6 +1,7 @@
 // Gated delta rule recurrence. Workgroup = (v-head h, slice of 16 value columns); 128 threads as
 // 16 columns x 8 key-groups, each thread keeps 16 state entries S[k][v] in registers.
 //   S *= exp(g); kv = S^T k; d = (v - kv) * beta; S += k d^T; o = S^T q
+// V_TILED: value head h pairs with key head h % n_k (GGUF layout) instead of h / ratio.
 #version 460
 #include "common.glsl"
 
@@ -21,7 +22,11 @@ shared float qs[KD], ks[KD], part[KG][VS], dsh[VS], red[8];
 void main() {
     const uint h = gl_WorkGroupID.x, vs = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
     const uint col = tid % VS, kg = tid / VS;
+#ifdef V_TILED
+    const uint kh = h % (pc.n_v_heads / pc.ratio), vcol = vs * VS + col;
+#else
     const uint kh = h / pc.ratio, vcol = vs * VS + col;
+#endif
     F32 st = F32(pc.state + uint64_t(h) * KD * DV * 4u);
     float S[KPER];
     [[unroll]] for (uint i = 0; i < KPER; i++) S[i] = st.v[(kg * KPER + i) * DV + vcol];

@@ -1,4 +1,5 @@
 // x[t] += sigmoid(sgate[t]) * shared_y[t] + sum_k weight[t,k] * expert_y[row[t,k]]
+// ASSIGN: x[t] = ... (the block output goes to its own buffer)
 #version 460
 #include "common.glsl"
 
@@ -18,5 +19,9 @@ void main() {
         const uint e = (t * pc.top_k + k) * 2u;
         acc += uintBitsToFloat(tb.v[e + 1u]) * ey.v[tb.v[e] * pc.dim + d];
     }
+#ifdef ASSIGN
+    x.v[t * pc.dim + d] = acc;
+#else
     x.v[t * pc.dim + d] += acc;
+#endif
 }

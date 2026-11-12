@@ -32,4 +32,10 @@ vec4 bf16x2x2(uvec2 w) { return vec4(bf16_lo(w.x), bf16_hi(w.x), bf16_lo(w.y), b
 
 float silu(float x) { return x / (1.0 + exp(-x)); }
 float sigmoid(float x) { return 1.0 / (1.0 + exp(-x)); }
-float softplus(float x) { return x > 20.0 ? x : log(1.0 + exp(x)); }
+// log1p(exp(x)); the series keeps full precision where 1 + exp(x) would round the small term away (the
+// deltanet decay of long-memory heads lives there, and its error would accumulate over the sequence)
+float softplus(float x) {
+    if (x > 20.0) return x;
+    const float e = exp(x);
+    return e < 0.01 ? e * (1.0 - e * (0.5 - e * (1.0 / 3.0))) : log(1.0 + e);
+}

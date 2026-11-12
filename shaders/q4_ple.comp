@@ -1,0 +1,69 @@
+// PLE (hashed n-gram embedding) injection into the residual streams x[n][hc][dim].
+//   PLE_GATE  workgroup = (token, stream): g = sigmoid(ssqrt(<norm(key), norm(x)> / sqrt(dim)));
+//             gated = g * value[t]; pad[hist + t] = norm(gated)        (ssqrt = signed square root)
+//   PLE_CONV  thread = (channel of hc*dim, token): x += gated + silu(sum_k w[ch][k] * pad[hist + t - (K-1-k)*dil][ch])
+// pad holds the `hist` previous normed rows in front of this call's rows.
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+#ifdef PLE_GATE
+layout(push_constant) uniform PC {
+    uint64_t key, value, x, wk, wq, wc, gated, pad;
+    uint dim, hc, hist;
+    float eps;
+} pc;
+
+shared float red[3][8];
+
+float wg_sum(float v, uint slot) {
+    v = subgroupAdd(v);
+    if (gl_SubgroupInvocationID == 0u) red[slot][gl_SubgroupID] = v;
+    barrier();
+    float tot = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; i++) tot += red[slot][i];
+    return tot;
+}
+
+void main() {
+    const uint t = gl_WorkGroupID.x, s = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x, D = pc.dim;
+    const uint64_t row = uint64_t(t * pc.hc + s) * D * 4u, wrow = uint64_t(s) * D * 4u;
+    F32 key = F32(pc.key + row), x = F32(pc.x + row), value = F32(pc.value + uint64_t(t) * D * 4u);
+    F32 wk = F32(pc.wk + wrow), wq = F32(pc.wq + wrow), wc = F32(pc.wc + wrow);
+    float sk = 0.0, sq = 0.0;
+    for (uint i = tid; i < D; i += 256u) { sk += key.v[i] * key.v[i]; sq += x.v[i] * x.v[i]; }
+    const float rk = inversesqrt(wg_sum(sk, 0u) / float(D) + pc.eps);
+    const float rq = inversesqrt(wg_sum(sq, 1u) / float(D) + pc.eps);
+    float dp = 0.0;
+    for (uint i = tid; i < D; i += 256u) dp += key.v[i] * wk.v[i] * x.v[i] * wq.v[i];
+    const float d = wg_sum(dp, 2u) * rk * rq * inversesqrt(float(D));
+    const float g = sigmoid(sign(d) * sqrt(max(abs(d), 1e-6)));
+    barrier();
+    float sv = 0.0;
+    for (uint i = tid; i < D; i += 256u) { const float v = g * value.v[i]; sv += v * v; }
+    const float rv = inversesqrt(wg_sum(sv, 0u) / float(D) + pc.eps);
+    F32 gated = F32(pc.gated + row), pad = F32(pc.pad + uint64_t((pc.hist + t) * pc.hc + s) * D * 4u);
+    for (uint i = tid; i < D; i += 256u) {
+        const float v = g * value.v[i];
+        gated.v[i] = v;
+        pad.v[i] = v * rv * wc.v[i];
+    }
+}
+#else
+layout(push_constant) uniform PC {
+    uint64_t x, gated, pad, w;
+    uint width, kernel, dil, hist;  // width = hc * dim
+} pc;
+
+void main() {
+    const uint ch = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
+    if (ch >= pc.width) return;
+    F32 pad = F32(pc.pad), w = F32(pc.w);
+    float acc = 0.0;
+    for (uint k = 0; k < pc.kernel; k++)
+        acc += w.v[ch * pc.kernel + k] * pad.v[(pc.hist + t - (pc.kernel - 1u - k) * pc.dil) * pc.width + ch];
+    const uint i = t * pc.width + ch;
+    F32(pc.x).v[i] += F32(pc.gated).v[i] + silu(acc);
+}
+#endif

@@ -1,0 +1,92 @@
+// Y[t, row] = sum_c W[row, c] * X[t, c] for GGUF-quantized W, decoded on the fly. One 32-lane subgroup per
+// row, 8 rows per workgroup, up to NT tokens per pass (gl_WorkGroupID.y selects the token chunk).
+// The weight codec is picked per pipeline, see q4_codec.glsl.
+// Variants: SWIGLU computes silu(W1 x) * (W2 x); EXPERT reads per-workgroup weights/tokens from a table.
+#version 460
+#include "common.glsl"
+#include "q4_codec.glsl"
+
+layout(local_size_x = 256) in;
+#define NT 8
+
+#ifdef EXPERT
+// Grouped expert rows: entry = {expert base address, first row, count <= NT}. Rows index `toks` (token
+// ids, x_mode 0) or the x buffer directly (x_mode 1). Outputs go to y rows start..start+count.
+struct Entry { uint64_t base; uint start, count; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Table { Entry e[]; };
+layout(push_constant) uniform PC {
+    uint64_t table, toks, x, y;
+    uint woff1, soff1, woff2, soff2, rows, cols, x_stride, y_stride, x_mode;
+} pc;
+#else
+layout(push_constant) uniform PC {
+    uint64_t w1, s1, w2, s2, x, y;
+    uint rows, cols, n, x_stride, y_stride, post;  // post 1: y = silu(y * post_scale)
+    float post_scale;
+} pc;
+#endif
+
+// Weights [16c, 16c + 16) of `row` as four vec4.
+void decode(uint64_t w, uint64_t s, uint row, uint c, out vec4 a0, out vec4 a1, out vec4 a2, out vec4 a3) {
+    decode8(w, s, pc.cols, row, c * 2u, a0, a1);
+    decode8(w, s, pc.cols, row, c * 2u + 1u, a2, a3);
+}
+
+void main() {
+    const uint team = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    const uint row = gl_WorkGroupID.x * 8u + team;
+    if (row >= pc.rows) return;
+    const uint chunks = pc.cols / 16u;
+
+#ifdef EXPERT
+    const Entry en = Table(pc.table).e[gl_WorkGroupID.y];
+    const uint nt = en.count;
+    const uint64_t w1 = en.base + pc.woff1, s1 = en.base + pc.soff1, w2 = en.base + pc.woff2, s2 = en.base + pc.soff2;
+    uint xrow[NT];
+    [[unroll]] for (uint t = 0; t < NT; t++)
+        xrow[t] = t < nt ? (pc.x_mode == 0u ? U32(pc.toks).v[en.start + t] : en.start + t) : 0u;
+#else
+    const uint t0 = gl_WorkGroupID.y * NT;
+    const uint nt = min(NT, pc.n - t0);
+    const uint64_t w1 = pc.w1, s1 = pc.s1, w2 = pc.w2, s2 = pc.s2;
+    uint xrow[NT];
+    for (uint t = 0; t < NT; t++) xrow[t] = t0 + t;
+#endif
+
+    float acc1[NT], acc2[NT];
+    for (uint t = 0; t < NT; t++) { acc1[t] = 0.0; acc2[t] = 0.0; }
+
+    for (uint c = lane; c < chunks; c += 32u) {
+        vec4 a0, a1, a2, a3;
+        decode(w1, s1, row, c, a0, a1, a2, a3);
+#ifdef SWIGLU
+        vec4 b0, b1, b2, b3;
+        decode(w2, s2, row, c, b0, b1, b2, b3);
+#endif
+        [[unroll]] for (uint t = 0; t < NT; t++) {
+            if (t >= nt) break;
+            F4 xs = F4(pc.x + uint64_t(xrow[t]) * pc.x_stride * 4u);
+            const vec4 x0 = xs.v[c * 4u], x1 = xs.v[c * 4u + 1u], x2 = xs.v[c * 4u + 2u], x3 = xs.v[c * 4u + 3u];
+            acc1[t] += dot(a0, x0) + dot(a1, x1) + dot(a2, x2) + dot(a3, x3);
+#ifdef SWIGLU
+            acc2[t] += dot(b0, x0) + dot(b1, x1) + dot(b2, x2) + dot(b3, x3);
+#endif
+        }
+    }
+    [[unroll]] for (uint t = 0; t < NT; t++) {
+        if (t >= nt) break;
+        float r = subgroupAdd(acc1[t]);
+#ifdef SWIGLU
+        r = silu(r) * subgroupAdd(acc2[t]);
+#endif
+        if (lane == 0u) {
+#ifdef EXPERT
+            const uint yrow = en.start + t;
+#else
+            const uint yrow = t0 + t;
+            if (pc.post == 1u) r = silu(r * pc.post_scale);
+#endif
+            F32(pc.y + uint64_t(yrow) * pc.y_stride * 4u).v[row] = r;
+        }
+    }
+}

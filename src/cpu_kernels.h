@@ -27,6 +27,9 @@ struct MatJob {
 void run_jobs(ThreadPool& pool, const std::vector<MatJob>& jobs);
 
 float dot_f32(const float* a, const float* b, int n);
+float half_to_f32(uint16_t h);
+// Y[t, r0 + i] for i < nr (<= 4), all n tokens, from nr dequantized rows w[i * cols].
+void gemm_block(const float* w, int nr, const float* x, int n, int cols, float* y, int rows, int r0);
 void axpy(float* out, float p, const float* v, int n);  // out += p * v
 void rmsnorm(const float* x, const BMat& w, float* out, int n, float eps, bool one_plus);
 // One gated-delta-rule step for a head with state S[KD][DV].
