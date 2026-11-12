@@ -35,7 +35,8 @@ F32 / F16 / BF16 / Q8_0 / Q4_K / Q5_K / Q6_K / Q5_1 / IQ4_NL; the Vulkan backend
 Q4_K, Q5_K, Q8_0 (gate/up) and additionally Q5_1 (down).
 
 For the GGUF model the Vulkan backend is built for a machine with much more RAM than VRAM: the dense weights
-(~5.5 GB) and a cache of the most used experts (whatever VRAM is free, up to 12 GB; `--expert-cache MB`, 0 = none) live in VRAM, and the
+(~5.5 GB) and a cache of the most used experts (6 GB by default; `--expert-cache MB`, 0 = none; raise it only if that much VRAM
+is really free, an overcommitted card is much slower) live in VRAM, and the
 CPU computes every other expert straight from the memory-mapped GGUF (72 GB of experts, so plan for ~96 GB of RAM or
 more). Each layer does one GPU round trip, so other programs using the GPU slow it down noticeably. `--threads N`
 sets the CPU threads for the experts (default: 3/8 of the hardware threads).

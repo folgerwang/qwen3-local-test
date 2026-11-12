@@ -42,7 +42,9 @@ constexpr int GEMM_MIN = 9;         // dense matrices use the tiled GEMM from th
 constexpr int EXPERT_GEMM_MIN = 33; // grouped experts use the tiled GEMM from this many tokens
 constexpr int ATT_PART_MAX = 2048;  // max (tokens x key splits) for split-K attention scratch
 constexpr int MAX_FILLS = 4;        // cache fills per forward pass (each is a CPU repack + upload)
-constexpr VkDeviceSize AUTO_CACHE = 12ull << 30; // default VRAM budget for cached experts (never more than is free)
+// Default VRAM budget for cached experts. Deliberately modest: the free-VRAM figure Vulkan reports does not
+// account for what other programs hold, and an overcommitted card is far slower than a small cache.
+constexpr VkDeviceSize AUTO_CACHE = 6ull << 30;
 constexpr float DRAFT_P_MIN = 0.5f; // stop drafting when the draft head's best token is less likely than this
 
 // Push-constant layouts (must match the shaders, std430)
