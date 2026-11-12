@@ -41,7 +41,8 @@ constexpr int NT = 8;               // tokens per matvec pass (matches q4_matmul
 constexpr int GEMM_MIN = 9;         // dense matrices use the tiled GEMM from this many tokens
 constexpr int EXPERT_GEMM_MIN = 33; // grouped experts use the tiled GEMM from this many tokens
 constexpr int ATT_PART_MAX = 2048;  // max (tokens x key splits) for split-K attention scratch
-constexpr int MAX_FILLS = 4;        // cache fills per forward pass (each is a CPU repack + upload)
+constexpr int MAX_FILLS = 64;        // cache fills per forward pass (each is a CPU repack + upload)
+constexpr uint32_t FILL_MARGIN = 2; // session uses an expert needs over the cached one it replaces
 // Default VRAM budget for cached experts. Deliberately modest: the free-VRAM figure Vulkan reports does not
 // account for what other programs hold, and an overcommitted card is far slower than a small cache.
 constexpr VkDeviceSize AUTO_CACHE = 6ull << 30;
@@ -152,18 +153,32 @@ public:
     }
 
     // The GPU round trip of every layer needs a free core for the driver, and the experts are bound by memory
-    // bandwidth well before all hardware threads are busy (12 of 32 measured fastest on a 16-core CPU).
+    // bandwidth well before all hardware threads are busy (16 of 32 measured fastest on a 16-core CPU).
     static int expert_threads(int requested) {
         if (requested > 0) return requested;
         const int hw = (int)std::thread::hardware_concurrency();
-        return std::max(1, hw >= 16 ? hw * 3 / 8 : hw - 2);
+        return std::max(1, hw >= 16 ? hw / 2 : hw - 2);
     }
 
     ~Qwen4Vulkan() override {
         std::fprintf(stderr, "[vulkan] expert lookups: %llu on the GPU (cached), %llu on the CPU; %llu cache fills\n",
                      (unsigned long long)hits_, (unsigned long long)misses_, (unsigned long long)fills_);
         if (std::getenv("QW_PROFILE"))
-            std::fprintf(stderr, "[vulkan] moe time: %.2fs waiting for the GPU, %.2fs CPU experts\n", t_gpu_, t_cpu_);
+        {
+            std::fprintf(stderr, "[vulkan] moe time: %.2fs waiting for the GPU, %.2fs CPU experts, %.2fs cache fills\n", t_gpu_, t_cpu_, t_fill_);
+            // the hit rate a cache of this size would have had with this session's hottest experts in it
+            uint64_t best = 0, tot = 0, distinct = 0;
+            for (size_t k = 0; k < slots_.size(); k++) {
+                std::vector<uint32_t> v;
+                for (int key = 0; key < n_keys(); key++)
+                    if (L_[key / c_.n_experts].cls == (int)k && recent_[key]) v.push_back(recent_[key]);
+                std::sort(v.begin(), v.end(), std::greater<uint32_t>());
+                distinct += v.size();
+                for (size_t i = 0; i < v.size(); i++) { tot += v[i]; if (i < slots_[k].size()) best += v[i]; }
+            }
+            std::fprintf(stderr, "[vulkan] %llu distinct experts used; a cache holding the hottest would serve %.0f%% of lookups\n",
+                         (unsigned long long)distinct, tot ? 100.0 * best / tot : 0.0);
+        }
         save_stats();
     }
 
@@ -329,7 +344,7 @@ private:
     Buf* htab_ = nullptr;                     // entries | toks | comb tables written by the CPU
     Buf* hcy_ = nullptr;                      // expert outputs computed on the CPU (CPU -> GPU)
     VkDeviceSize htab_toks_ = 0, htab_comb_ = 0;
-    double t_gpu_ = 0, t_cpu_ = 0;  // seconds per stage of the MoE sync (QW_PROFILE)
+    double t_gpu_ = 0, t_cpu_ = 0, t_fill_ = 0;  // seconds per stage of the MoE sync (QW_PROFILE)
     uint64_t tick_ = 0, hits_ = 0, misses_ = 0, fills_ = 0;
 
     // ---- setup ----------------------------------------------------------------------------
@@ -691,7 +706,7 @@ private:
         }
         if (v < 0) return;
         if (sl[v].key >= 0) {
-            if (recent_[key] < recent_[sl[v].key] + 3) return;
+            if (recent_[key] < recent_[sl[v].key] + FILL_MARGIN) return;
             where_[sl[v].key] = {-1, -1};
         }
         up_.put_fn({sl[v].buf, sl[v].off}, cls_size_[k], [&](void* d) { write_expert(key, (uint8_t*)d); });
@@ -907,8 +922,7 @@ private:
             if (where_[key].first < 0) {
                 misses_ += per_[e].size();
                 cpu_experts_.push_back(e);
-                if ((int)pending_.size() < MAX_FILLS && std::find(pending_.begin(), pending_.end(), key) == pending_.end())
-                    pending_.push_back(key);
+                pending_.push_back(key);
                 continue;
             }
             hits_ += per_[e].size();
@@ -1014,9 +1028,17 @@ private:
             }
         }, 4);
         // cache fills queued by the previous pass
-        for (int key : pending_)
-            if (where_[key].first < 0) try_fill(key);
-        pending_.clear();
+        // (the most used of the experts the previous pass missed, over all layers)
+        {
+            const size_t nf = std::min<size_t>(MAX_FILLS, pending_.size());
+            std::partial_sort(pending_.begin(), pending_.begin() + nf, pending_.end(),
+                              [&](int a, int b) { return recent_[a] != recent_[b] ? recent_[a] > recent_[b] : a < b; });
+            auto tf0 = std::chrono::steady_clock::now();
+            for (size_t i = 0; i < nf; i++)
+                if (where_[pending_[i]].first < 0) try_fill(pending_[i]);
+            t_fill_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - tf0).count();
+            pending_.clear();
+        }
         up_.flush();
         tick_++;
         gpu_.begin();
