@@ -41,6 +41,7 @@
 #include "backend.h"
 #include "cpu_kernels.h"
 #include "shaders_spv.h"
+#include "sysmem.h"
 #include "vision.h"
 
 namespace {
@@ -71,6 +72,7 @@ struct Buf {
     VkDeviceSize size = 0;
     uint64_t addr = 0;
     uint8_t* map = nullptr;
+    VkDeviceSize dev_bytes = 0;  // device-local bytes this buffer accounts for
 };
 
 // A sub-range of a Buf.
@@ -108,6 +110,24 @@ public:
         phys_ = devs[best];
         vkGetPhysicalDeviceProperties(phys_, &props_);
         vkGetPhysicalDeviceMemoryProperties(phys_, &memprops_);
+        for (uint32_t i = 0; i < memprops_.memoryHeapCount; i++)
+            if ((memprops_.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+                (heap_ < 0 || memprops_.memoryHeaps[i].size > memprops_.memoryHeaps[heap_].size))
+                heap_ = (int)i;
+        {   // adapter LUID -> system-wide dedicated memory use (all programs), sampled before we allocate anything
+            VkPhysicalDeviceIDProperties idp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+            VkPhysicalDeviceProperties2 ip2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            ip2.pNext = &idp;
+            vkGetPhysicalDeviceProperties2(phys_, &ip2);
+            if (idp.deviceLUIDValid) {
+                std::memcpy(&luid_low_, idp.deviceLUID, 4);
+                std::memcpy(&luid_high_, idp.deviceLUID + 4, 4);
+                has_luid_ = true;
+                const long long u = gpu_dedicated_used(luid_low_, luid_high_);
+                if (u >= 0) others_at_start_ = (VkDeviceSize)u;
+                else has_luid_ = false;
+            }
+        }
 
         VkPhysicalDeviceSubgroupSizeControlProperties sscp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -279,20 +299,38 @@ public:
         }
     }
 
-    // Free device-local memory we may still allocate (budget - usage), or heap size if unknown.
-    VkDeviceSize device_free() const {
-        int heap = -1;
-        for (uint32_t i = 0; i < memprops_.memoryHeapCount; i++)
-            if ((memprops_.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
-                (heap < 0 || memprops_.memoryHeaps[i].size > memprops_.memoryHeaps[heap].size))
-                heap = (int)i;
-        if (!has_budget_) return memprops_.memoryHeaps[heap].size - allocated_device_;
-        VkPhysicalDeviceMemoryBudgetPropertiesEXT bp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
-        VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
-        mp.pNext = &bp;
-        vkGetPhysicalDeviceMemoryProperties2(phys_, &mp);
-        return bp.heapBudget[heap] > bp.heapUsage[heap] ? bp.heapBudget[heap] - bp.heapUsage[heap] : 0;
+    // Dedicated memory in use on the card by every program including this one, or -1 if the OS does not say.
+    long long system_used() const {
+        if (!has_luid_) return -1;
+        const long long u = gpu_dedicated_used(luid_low_, luid_high_);
+        if (u < 0) return -1;
+        return u;
     }
+    VkDeviceSize heap_size() const { return memprops_.memoryHeaps[heap_].size; }
+
+    // Device-local memory nobody is using (what the --vram-reserve margin is measured against). The Vulkan
+    // budget only knows this process, so the system-wide figure decides when it is available.
+    VkDeviceSize device_free(bool planning = false) const {
+        const VkDeviceSize size = heap_size();
+        VkDeviceSize free = size > allocated_device_ ? size - allocated_device_ : 0;
+        if (has_budget_) {
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT bp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+            VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+            mp.pNext = &bp;
+            vkGetPhysicalDeviceMemoryProperties2(phys_, &mp);
+            free = bp.heapBudget[heap_] > bp.heapUsage[heap_] ? bp.heapBudget[heap_] - bp.heapUsage[heap_] : 0;
+        }
+        long long u = system_used();
+        if (u >= 0) {
+            // while sizing the cache, memory we allocated but have not touched yet may not be counted by the OS
+            if (planning) u = std::max<long long>(u, (long long)(others_at_start_ + allocated_device_));
+            const VkDeviceSize sys_free = (VkDeviceSize)u < size ? size - (VkDeviceSize)u : 0;
+            free = std::min(free, sys_free);
+        }
+        return free;
+    }
+    bool sees_system_vram() const { return has_luid_; }
+    VkDeviceSize others_at_start() const { return others_at_start_; }
 
     // Returns nullptr instead of throwing when `may_fail` and the allocation does not succeed.
     Buf* create(VkDeviceSize size, Mem kind, bool may_fail = false) {
@@ -324,12 +362,13 @@ public:
         ai.buffer = b->buf;
         b->addr = vkGetBufferDeviceAddress(dev_, &ai);
         if (kind != Mem::Device) VK_CHECK(vkMapMemory(dev_, b->mem, 0, VK_WHOLE_SIZE, 0, (void**)&b->map));
-        else allocated_device_ += req.size;
+        else { allocated_device_ += req.size; b->dev_bytes = req.size; }
         bufs_.push_back(b);
         return b;
     }
 
     void destroy(Buf* b) {
+        allocated_device_ -= b->dev_bytes;
         vkDestroyBuffer(dev_, b->buf, nullptr);
         vkFreeMemory(dev_, b->mem, nullptr);
         bufs_.erase(std::find(bufs_.begin(), bufs_.end(), b));
@@ -508,6 +547,11 @@ private:
     std::vector<Buf*> bufs_;
     VkDeviceSize allocated_device_ = 0;
     bool has_budget_ = false;
+    int heap_ = -1;                      // the device-local heap
+    bool has_luid_ = false;              // system-wide VRAM use is available (Windows)
+    unsigned luid_low_ = 0;
+    long luid_high_ = 0;
+    VkDeviceSize others_at_start_ = 0;   // dedicated memory in use before this process allocated any
     bool coop_ = false, coop_fp8_ = false;
     uint32_t tfam_ = UINT32_MAX;
     VkQueue tqueue_ = VK_NULL_HANDLE;
@@ -643,6 +687,7 @@ class VulkanBackend final : public Backend {
 public:
     VulkanBackend(const Config& c, const ModelWeights& w, int max_ctx, const VulkanOptions& opt)
         : c_(c), w_(w), max_ctx_(max_ctx), opt_(opt), arena_(gpu_), up_(gpu_) {
+        q4_ = c_.expert_q4;
         upload_weights();
         alloc_state();
         setup_vision();  // before the expert cache takes the remaining VRAM
@@ -798,10 +843,13 @@ private:
     // experts
     struct Slot { Buf* buf = nullptr; VkDeviceSize off = 0; int key = -1; uint64_t tick = 0; };
     std::vector<Slot> slots_;               // VRAM cache
+    std::vector<Buf*> slot_bufs_;           // its buffers, in slot order (the last one's slots are the last slots)
+    std::chrono::steady_clock::time_point vram_checked_{};
     std::vector<int> where_;                // key (layer * n_experts + expert) -> slot or -1
     std::vector<Buf*> host_bufs_;           // pinned copies of all experts
     VkDeviceSize host_per_buf_ = 0;
     bool pinned_ = false;
+    bool q4_ = false;                       // experts are 4-bit GPTQ (shader variants *_q4_*)
     bool hybrid_ = false;                   // CPU computes cache misses (see header comment)
     std::unique_ptr<ThreadPool> cpu_;
     Buf* hxn_ = nullptr;                    // hybrid: normalized activations of the layer (GPU -> CPU)
@@ -978,12 +1026,12 @@ private:
         conv_saved_ = gpu_.create(cs, Mem::Device);
         rec_saved_ = gpu_.create(rs, Mem::Device);
         hx_ = gpu_.create((VkDeviceSize)NMAX * HH_ * 4, Mem::HostUpload);
+        su_ = act((size_t)NMAX * c_.shared_inter);  // BF16 shared expert: the up projection (qwen4, GPTQ checkpoints)
         if (c_.qwen4) {
             hn_ = act((size_t)NMAX * HH_);
             hu_ = act((size_t)NMAX * HH_);
             hd_ = act((size_t)NMAX * c_.hc_rank);
             inj_ = act((size_t)NMAX * c_.hc);
-            su_ = act((size_t)NMAX * c_.shared_inter);
             if (c_.ple_layer >= 0) {
                 emb_ = act((size_t)NMAX * c_.ple_dim);
                 pk_ = act((size_t)NMAX * HH_);
@@ -1121,7 +1169,24 @@ private:
     }
     uint64_t home_addr(int key) const { return pinned_ ? host_ptr(key).addr() : 0; }
 
+    // One 4-bit GPTQ matrix into the slot layout the shaders read: weight words row-major [rows][cols/8] and fp16
+    // scales [rows][cols/128] (GPTQ stores both input-major, so this is a transpose of 32-bit words / halves).
+    static void write_q4(const Q4Mat& m, uint8_t* w, uint8_t* s) {
+        const int words = m.cols / 8, groups = m.cols / 128;
+        uint32_t* dw = (uint32_t*)w;
+        uint16_t* ds = (uint16_t*)s;
+        for (int r = 0; r < m.rows; r++) {
+            for (int k = 0; k < words; k++) dw[(size_t)r * words + k] = m.qweight[(size_t)k * m.rows + r];
+            for (int g = 0; g < groups; g++) ds[(size_t)r * groups + g] = m.scales[(size_t)g * m.rows + r];
+        }
+    }
     void write_expert(const Expert& ex, uint8_t* d) const {
+        if (q4_) {
+            write_q4(ex.g4, d, d + off_sg_);
+            write_q4(ex.u4, d + off_up_, d + off_su_);
+            write_q4(ex.d4, d + off_down_, d + off_sd_);
+            return;
+        }
         std::memcpy(d, ex.gate.w, ex.gate.weight_bytes());
         std::memcpy(d + off_up_, ex.up.w, ex.up.weight_bytes());
         std::memcpy(d + off_down_, ex.down.w, ex.down.weight_bytes());
@@ -1131,12 +1196,17 @@ private:
     }
     // After the pinned copy is made, the mapped file pages it came from need not stay in our working set
     // (they remain in the OS file cache); keeps the load-time peak near the pinned size.
-    static void release_source(const Expert& ex) {
+    void release_source(const Expert& ex) const {
 #ifdef _WIN32
-        for (const QMat* m : {&ex.gate, &ex.up, &ex.down}) {
-            const uintptr_t page = 4096, a = (uintptr_t)m->w & ~(page - 1);
-            const uintptr_t e = ((uintptr_t)m->w + m->weight_bytes()) & ~(page - 1);  // whole pages inside the tensor only
+        auto release = [](const void* p, size_t n) {
+            const uintptr_t page = 4096, a = ((uintptr_t)p + page - 1) & ~(page - 1);
+            const uintptr_t e = ((uintptr_t)p + n) & ~(page - 1);  // whole pages inside the tensor only
             if (e > a) VirtualUnlock((LPVOID)a, e - a);
+        };
+        if (q4_) {
+            for (const Q4Mat* m : {&ex.g4, &ex.u4, &ex.d4}) release(m->qweight, m->weight_bytes());
+        } else {
+            for (const QMat* m : {&ex.gate, &ex.up, &ex.down}) release(m->w, m->weight_bytes());
         }
 #else
         (void)ex;
@@ -1146,12 +1216,17 @@ private:
     void setup_experts() {
         const Expert& e0 = w_.layers[0].experts[0];
         auto align = [](VkDeviceSize v) { return (v + 255) & ~VkDeviceSize(255); };
-        VkDeviceSize o = align(e0.gate.weight_bytes());
-        off_up_ = o; o = align(o + e0.up.weight_bytes());
-        off_down_ = o; o = align(o + e0.down.weight_bytes());
-        off_sg_ = o; o = align(o + e0.gate.scale_count() * 2);
-        off_su_ = o; o = align(o + e0.up.scale_count() * 2);
-        off_sd_ = o; o = align(o + e0.down.scale_count() * 2);
+        // slot: gate | up | down weights, then their scales (FP8: bf16 per 128x128 block; 4-bit: fp16 per row and 128 inputs)
+        const size_t wg = q4_ ? e0.g4.weight_bytes() : e0.gate.weight_bytes(), wu = q4_ ? e0.u4.weight_bytes() : e0.up.weight_bytes(),
+                     wd = q4_ ? e0.d4.weight_bytes() : e0.down.weight_bytes();
+        const size_t sg = q4_ ? e0.g4.scale_count() : e0.gate.scale_count(), su = q4_ ? e0.u4.scale_count() : e0.up.scale_count(),
+                     sd = q4_ ? e0.d4.scale_count() : e0.down.scale_count();
+        VkDeviceSize o = align(wg);
+        off_up_ = o; o = align(o + wu);
+        off_down_ = o; o = align(o + wd);
+        off_sg_ = o; o = align(o + sg * 2);
+        off_su_ = o; o = align(o + su * 2);
+        off_sd_ = o; o = align(o + sd * 2);
         slot_size_ = o;
         usage_.assign(n_keys(), 0);
         load_stats();
@@ -1160,7 +1235,7 @@ private:
         VkDeviceSize budget;
         if (opt_.expert_cache_mb) budget = (VkDeviceSize)opt_.expert_cache_mb << 20;
         else {
-            const VkDeviceSize free = gpu_.device_free(), margin = (VkDeviceSize)opt_.vram_reserve_mb << 20;  // for other programs
+            const VkDeviceSize free = gpu_.device_free(true), margin = (VkDeviceSize)opt_.vram_reserve_mb << 20;  // for other programs
             budget = free > margin ? free - margin : 0;
         }
         size_t want = std::min<size_t>(n_keys(), budget / slot_size_);
@@ -1170,11 +1245,13 @@ private:
             const size_t k = std::min(per_chunk, want - slots_.size());
             Buf* b = gpu_.create(k * slot_size_, Mem::Device, true);
             if (!b) break;
+            slot_bufs_.push_back(b);
             for (size_t i = 0; i < k; i++) slots_.push_back({b, i * slot_size_, -1, 0});
         }
         where_.assign(n_keys(), -1);
         // Misses are read by the GPU from pinned host memory when it fits (fast on PCIe 4/5 machines: measured
         // faster than computing them on the CPU here). If pinning fails, or with --hybrid, the CPU computes them.
+        if (opt_.hybrid > 0 && q4_) throw std::runtime_error("--hybrid: the CPU cannot run 4-bit experts yet");
         hybrid_ = opt_.hybrid > 0;
         if (!hybrid_) {
             // pinned host copies of every expert
@@ -1188,8 +1265,9 @@ private:
                 if (ms.ullAvailPhys < need + keep) {
                     pin = false;
                     std::fprintf(stderr, "[vulkan] not pinning %.1f GB of experts: %.1f GB of RAM is available and %.1f GB "
-                                         "must stay free (--ram-reserve); uncached experts run on the CPU instead\n",
-                                 need / 1073741824.0, ms.ullAvailPhys / 1073741824.0, keep / 1073741824.0);
+                                         "must stay free (--ram-reserve); uncached experts %s instead\n",
+                                 need / 1073741824.0, ms.ullAvailPhys / 1073741824.0, keep / 1073741824.0,
+                                 q4_ ? "are uploaded to the GPU when needed (slow)" : "run on the CPU");
                 }
             }
 #endif
@@ -1226,7 +1304,7 @@ private:
                     std::fprintf(stderr, "[vulkan] could not pin %.1f GB of experts in host memory\n", n_keys() * slot_size_ / 1073741824.0);
                 }
             }
-            if (!pinned_ && opt_.hybrid < 0) hybrid_ = true;
+            if (!pinned_ && opt_.hybrid < 0) hybrid_ = !q4_;  // 4-bit: upload misses instead (the CPU path is FP8 only)
             if (!pinned_ && !hybrid_ && slots_.size() < (size_t)c_.n_experts) throw std::runtime_error("not enough VRAM for the expert cache");
         }
         if (hybrid_) {
@@ -1243,6 +1321,9 @@ private:
         std::fprintf(stderr, "[vulkan] expert cache: %zu slots x %.2f MB = %.1f GB (%.0f%% of %zu experts)\n",
                      slots_.size(), slot_size_ / 1048576.0, slots_.size() * slot_size_ / 1073741824.0,
                      100.0 * slots_.size() / n_keys(), n_keys());
+        if (gpu_.sees_system_vram() && !opt_.expert_cache_mb)
+            std::fprintf(stderr, "[vulkan] VRAM: %.1f GB card, %.1f GB used by other programs, %.1f GB kept free (--vram-reserve)\n",
+                         gpu_.heap_size() / 1073741824.0, gpu_.others_at_start() / 1073741824.0, opt_.vram_reserve_mb / 1024.0);
 
         // location table: everything starts at its pinned home, then preload overwrites cached entries
         loc_ = arena_.alloc(n_keys() * 8);
@@ -1285,6 +1366,50 @@ private:
         std::fprintf(stderr, "[vulkan] preloaded %zu experts (%s) in %.1fs\n", n,
                      std::any_of(usage_.begin(), usage_.end(), [](uint64_t u) { return u > 0; }) ? "by usage stats" : "uniform",
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+
+    // Keeps the VRAM reserve while running: other programs may have grown since the cache was sized, and a full
+    // card makes Windows move video memory to system RAM, which stalls the whole desktop. Gives cache buffers
+    // back when free VRAM falls well under the reserve and takes one again once there is room (their experts
+    // are then read from host memory / computed on the CPU like any other miss).
+    // Called with the command buffer open and the GPU idle; checks about once a second.
+    void balance_vram() {
+        if (opt_.expert_cache_mb || !gpu_.sees_system_vram()) return;  // explicit cache size: the user's call
+        const auto now = std::chrono::steady_clock::now();
+        if (now - vram_checked_ < std::chrono::seconds(1)) return;
+        vram_checked_ = now;
+        const VkDeviceSize reserve = (VkDeviceSize)opt_.vram_reserve_mb << 20;
+        VkDeviceSize free = gpu_.device_free();
+        const size_t floor = std::min<size_t>(n_keys(), c_.n_experts);
+        if (free < reserve - reserve / 3) {
+            size_t dropped = 0;
+            while (free < reserve && slot_bufs_.size() > 1) {
+                Buf* b = slot_bufs_.back();
+                const size_t cnt = (size_t)(b->size / slot_size_);
+                if (slots_.size() < floor + cnt) break;
+                for (size_t i = slots_.size() - cnt; i < slots_.size(); i++) {
+                    const int key = slots_[i].key;
+                    if (key < 0) continue;
+                    where_[key] = -1;
+                    const uint64_t home = home_addr(key);
+                    gpu_.update({loc_.b, loc_.off + (VkDeviceSize)key * 8}, &home, 8);
+                }
+                slots_.resize(slots_.size() - cnt);
+                slot_bufs_.pop_back();
+                free += b->size;
+                gpu_.destroy(b);
+                dropped += cnt;
+            }
+            if (dropped)
+                std::fprintf(stderr, "\n[vulkan] other programs need VRAM: expert cache reduced to %.1f GB (%zu experts) to keep %.1f GB free\n",
+                             slots_.size() * slot_size_ / 1073741824.0, slots_.size(), reserve / 1073741824.0);
+        } else if (free > reserve + 2 * CHUNK && slots_.size() < n_keys()) {
+            const size_t k = std::min<size_t>(CHUNK / slot_size_, n_keys() - slots_.size());
+            if (Buf* b = gpu_.create(k * slot_size_, Mem::Device, true)) {
+                slot_bufs_.push_back(b);
+                for (size_t i = 0; i < k; i++) slots_.push_back({b, i * slot_size_, -1, 0});
+            }
+        }
     }
 
     // cache fills per pass, by bytes: big experts would otherwise eat the PCIe bandwidth the misses need
@@ -1361,6 +1486,16 @@ private:
     }
 
     // ---- recording helpers --------------------------------------------------------------------
+    // Expert pipeline: per-token matvec or tiled GEMM (tensor cores when available), FP8 or 4-bit weights.
+    const char* expert_pipeline(bool gemm, bool swiglu) const {
+        const bool tc = gpu_.coop();
+        if (q4_)
+            return gemm ? (tc ? (swiglu ? "gemm_coop_q4_expert_swiglu" : "gemm_coop_q4_expert") : (swiglu ? "gemm_q4_expert_swiglu" : "gemm_q4_expert"))
+                        : (swiglu ? "matmul_q4_expert_swiglu" : "matmul_q4_expert");
+        return gemm ? (tc ? (swiglu ? "gemm_coop_expert_swiglu" : "gemm_coop_expert") : (swiglu ? "gemm_fp8_expert_swiglu" : "gemm_fp8_expert"))
+                    : (swiglu ? "matmul_fp8_expert_swiglu" : "matmul_fp8_expert");
+    }
+
     void mat_q(const GQ& m, Ptr x, Ptr y, int n) {
         if (n >= GEMM_MIN) {
             PcGemm pc{m.w.addr(), m.s.addr(), 0, 0, x.addr(), y.addr(), (uint32_t)m.rows, (uint32_t)m.cols, (uint32_t)n,
@@ -1390,6 +1525,7 @@ private:
     // y = x W^T for an FP8 or BF16 projection (x rows are cols wide)
     void lin(const GL& m, Ptr x, Ptr y, int n) {
         if (m.q.rows) mat_q(m.q, x, y, n);
+        else if (n >= GEMM_MIN && m.b.cols % 16 == 0) gemm_b(m.b, Ptr{}, x, (uint32_t)m.b.cols, y, (uint32_t)m.b.rows, n, 0, false);
         else mat_b(m.b, x.addr(), y.addr(), n, m.b.cols);
     }
     void ew(Ptr a, Ptr b, uint32_t count, uint32_t mode, float scale) {
@@ -1539,8 +1675,8 @@ private:
             mat_swiglu(g.sh_gate.q, g.sh_up.q, xn_, sact_, n);
             gpu_.barrier();
         } else {
-            mat_b(g.sh_gate.b, xn_.addr(), sact_.addr(), n, H);
-            mat_b(g.sh_up.b, xn_.addr(), su_.addr(), n, H);
+            lin(g.sh_gate, xn_, sact_, n);
+            lin(g.sh_up, xn_, su_, n);
             gpu_.barrier();
             ew(sact_, su_, (uint32_t)(n * c_.shared_inter), 1, 1.0f);
             gpu_.barrier();
@@ -1583,12 +1719,11 @@ private:
         gpu_.barrier();
         PcExpert pu{entries_.addr(), toks_.addr(), xn_.addr(), act_.addr(), 0, (uint32_t)off_sg_, (uint32_t)off_up_,
                     (uint32_t)off_su_, (uint32_t)I, (uint32_t)H, (uint32_t)H, (uint32_t)I, 0};
-        const bool tc = gpu_.coop();
-        gpu_.dispatch_indirect(gemm ? (tc ? "gemm_coop_expert_swiglu" : "gemm_fp8_expert_swiglu") : "matmul_fp8_expert_swiglu", pu, args_);
+        gpu_.dispatch_indirect(expert_pipeline(gemm, true), pu, args_);
         gpu_.barrier();
         PcExpert pd{entries_.addr(), toks_.addr(), act_.addr(), ey_.addr(), (uint32_t)off_down_, (uint32_t)off_sd_, 0, 0,
                     (uint32_t)H, (uint32_t)I, (uint32_t)I, (uint32_t)H, 1};
-        gpu_.dispatch_indirect(gemm ? (tc ? "gemm_coop_expert" : "gemm_fp8_expert") : "matmul_fp8_expert", pd, {args_.b, args_.off + 12});
+        gpu_.dispatch_indirect(expert_pipeline(gemm, false), pd, {args_.b, args_.off + 12});
         gpu_.barrier();
         // qwen4 writes the block output (mixed into the streams by hc_out); otherwise add to the residual
         PcCombine pc{c_.qwen4 ? mix_.addr() : x_.addr(), sgate_.addr(), sy_.addr(), ey_.addr(), comb_.addr(), (uint32_t)H,
@@ -1650,13 +1785,12 @@ private:
             const uint64_t tab = htab_->addr, tk = htab_->addr + htab_toks_;
             PcExpert pu{tab, tk, xn_.addr(), act_.addr(), 0, (uint32_t)off_sg_, (uint32_t)off_up_, (uint32_t)off_su_,
                         (uint32_t)I, (uint32_t)H, (uint32_t)H, (uint32_t)I, 0};
-            const bool tc = gpu_.coop();
-            gpu_.dispatch(gemm ? (tc ? "gemm_coop_expert_swiglu" : "gemm_fp8_expert_swiglu") : "matmul_fp8_expert_swiglu", pu,
+            gpu_.dispatch(expert_pipeline(gemm, true), pu,
                           groups(I, gemm ? 64 : 8), ne);
             gpu_.barrier();
             PcExpert pd{tab, tk, act_.addr(), ey_.addr(), (uint32_t)off_down_, (uint32_t)off_sd_, 0, 0, (uint32_t)H,
                         (uint32_t)I, (uint32_t)I, (uint32_t)H, 1};
-            gpu_.dispatch(gemm ? (tc ? "gemm_coop_expert" : "gemm_fp8_expert") : "matmul_fp8_expert", pd, groups(H, gemm ? 64 : 8), ne);
+            gpu_.dispatch(expert_pipeline(gemm, false), pd, groups(H, gemm ? 64 : 8), ne);
         }
         gpu_.submit();
 
@@ -1743,6 +1877,7 @@ private:
         }
         tick_++;
         gpu_.begin();
+        balance_vram();
         // cache fills queued by the previous pass
         for (int key : pending_)
             if (where_[key] < 0 && !fill_slot(key)) break;

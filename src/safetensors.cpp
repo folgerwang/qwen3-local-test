@@ -24,6 +24,7 @@ size_t dtype_size(DType t) {
         case DType::F16: return 2;
         case DType::F8_E4M3: return 1;
         case DType::I64: return 8;
+        case DType::I32: return 4;
         default: return 0;
     }
 }
@@ -34,6 +35,7 @@ static DType parse_dtype(const std::string& s) {
     if (s == "F16") return DType::F16;
     if (s == "F8_E4M3") return DType::F8_E4M3;
     if (s == "I64") return DType::I64;
+    if (s == "I32") return DType::I32;
     return DType::Unknown;
 }
 

@@ -28,6 +28,16 @@ vec4 fp8x4(uint w) {
     return vec4(a.x, b.x, a.y, b.y);
 }
 
+// 4-bit GPTQ weights (symmetric, zero point 8): one word holds 8 consecutive inputs, low nibble first.
+void q4x8(uint w, out vec4 lo, out vec4 hi) {
+    lo = vec4(float(w & 15u), float((w >> 4) & 15u), float((w >> 8) & 15u), float((w >> 12) & 15u)) - 8.0;
+    hi = vec4(float((w >> 16) & 15u), float((w >> 20) & 15u), float((w >> 24) & 15u), float(w >> 28)) - 8.0;
+}
+float f16_at(uint64_t base, uint i) {
+    const vec2 h = unpackHalf2x16(U32(base).v[i >> 1]);
+    return (i & 1u) == 0u ? h.x : h.y;
+}
+
 vec4 bf16x2x2(uvec2 w) { return vec4(bf16_lo(w.x), bf16_hi(w.x), bf16_lo(w.y), bf16_hi(w.y)); }
 
 float silu(float x) { return x / (1.0 + exp(-x)); }

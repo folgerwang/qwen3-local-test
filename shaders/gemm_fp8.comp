@@ -61,14 +61,31 @@ void main() {
     for (uint k0 = 0; k0 < cols; k0 += BK) {
         {
             const uint widx = (wrow * cols + k0 + lk) / 8u;
+#ifdef Q4
+            // 4-bit: one word = 8 inputs; per-row scale of the 128-input group
+            vec4 a, b;
+            q4x8(U32(w1).v[widx], a, b);
+            const float sc = f16_at(s1, wrow * nblk + (k0 + lk) / 128u);
+            a *= sc;
+            b *= sc;
+#else
             const float sc = bf16_at(s1, (wrow / 128u) * nblk + k0 / 128u) * 256.0;
             const uvec2 wv = U2(w1).v[widx];
             const vec4 a = fp8x4(wv.x) * sc, b = fp8x4(wv.y) * sc;
+#endif
             [[unroll]] for (uint j = 0; j < 4u; j++) { Ws[lk + j][lr / 4u][lr % 4u] = a[j]; Ws[lk + 4u + j][lr / 4u][lr % 4u] = b[j]; }
 #ifdef SWIGLU
+#ifdef Q4
+            vec4 a2, b2;
+            q4x8(U32(w2).v[widx], a2, b2);
+            const float sc2 = f16_at(s2, wrow * nblk + (k0 + lk) / 128u);
+            a2 *= sc2;
+            b2 *= sc2;
+#else
             const float sc2 = bf16_at(s2, (wrow / 128u) * nblk + k0 / 128u) * 256.0;
             const uvec2 wv2 = U2(w2).v[widx];
             const vec4 a2 = fp8x4(wv2.x) * sc2, b2 = fp8x4(wv2.y) * sc2;
+#endif
             [[unroll]] for (uint j = 0; j < 4u; j++) { Ws2[lk + j][lr / 4u][lr % 4u] = a2[j]; Ws2[lk + 4u + j][lr / 4u][lr % 4u] = b2[j]; }
 #endif
             vec4 x0 = vec4(0.0), x1 = vec4(0.0);

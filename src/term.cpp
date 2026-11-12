@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <algorithm>
+#include <cstdint>
 #include <string_view>
 #include <vector>
 
@@ -14,6 +16,8 @@
 #else
 #include <poll.h>
 #include <signal.h>
+#include <sys/ioctl.h>
+#include <termios.h>
 #include <unistd.h>
 #endif
 
@@ -125,6 +129,7 @@ void init() {
     sa.sa_flags = 0;  // no SA_RESTART: a blocked read returns so the chat can cancel the line
     sigaction(SIGINT, &sa, nullptr);
 #endif
+    if (std::getenv("CLICOLOR_FORCE") || std::getenv("FORCE_COLOR")) g_color = true;  // styled output into a pipe
     if (std::getenv("NO_COLOR")) g_color = false;
 }
 
@@ -133,7 +138,231 @@ void catch_ctrl_c(bool on) { g_catch = on; }
 bool interrupted() { return g_interrupt; }
 void clear_interrupt() { g_interrupt = false; }
 
-std::string sgr(const char* code) { return g_color ? std::string("\x1b[") + code + "m" : std::string(); }
+std::string sgr(const char* code) { return g_color && *code ? std::string("\x1b[") + code + "m" : std::string(); }
+
+// ---------------------------------------------------------------------------------------------
+// Themes
+
+const std::vector<Theme>& themes() {
+    // name, description, then SGR codes: accent, dim, ok, warn, err, heading, code, fence
+    static const std::vector<Theme> v = {
+        {"dark", "for dark terminals", "38;5;141", "38;5;245", "38;5;114", "38;5;179", "38;5;203", "1;38;5;141", "38;5;180", "38;5;110"},
+        {"light", "for light terminals", "38;5;55", "38;5;243", "38;5;28", "38;5;130", "38;5;160", "1;38;5;55", "38;5;130", "38;5;24"},
+        {"dark-colorblind", "dark, without red/green contrasts", "38;5;75", "38;5;245", "38;5;75", "38;5;220", "38;5;208",
+         "1;38;5;75", "38;5;222", "38;5;153"},
+        {"light-colorblind", "light, without red/green contrasts", "38;5;25", "38;5;243", "38;5;25", "38;5;94", "38;5;166",
+         "1;38;5;25", "38;5;94", "38;5;24"},
+        {"ansi", "the terminal's own 16 colors", "36", "2", "32", "33", "31", "1;35", "33", "36"},
+        {"mono", "no colors, only bold and faint", "1", "2", "", "1", "1", "1", "4", ""},
+    };
+    return v;
+}
+
+namespace {
+int g_theme = 0;
+}
+
+const Theme& theme() { return themes()[g_theme]; }
+
+bool set_theme(const std::string& name) {
+    const auto& v = themes();
+    for (size_t i = 0; i < v.size(); i++)
+        if (name == v[i].name) {
+            g_theme = (int)i;
+            return true;
+        }
+    return false;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Geometry, measuring, menus
+
+int columns() {
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO i;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &i)) return std::max(20, i.srWindow.Right - i.srWindow.Left + 1);
+#else
+    winsize w{};
+    if (ioctl(1, TIOCGWINSZ, &w) == 0 && w.ws_col) return std::max<int>(20, w.ws_col);
+#endif
+    return 80;
+}
+
+namespace {
+// One UTF-8 character at s[i]: its code point and length in bytes.
+uint32_t decode(const std::string& s, size_t i, int& len) {
+    const uint8_t c = (uint8_t)s[i];
+    len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 1;
+    if (i + len > s.size()) len = 1;
+    if (len == 1) return c;
+    uint32_t cp = c & (0xFF >> (len + 1));
+    for (int k = 1; k < len; k++) cp = (cp << 6) | ((uint8_t)s[i + k] & 0x3F);
+    return cp;
+}
+int cp_width(uint32_t cp) {
+    if (cp < 0x20 || (cp >= 0x300 && cp <= 0x36F) || cp == 0x200B || cp == 0xFE0F) return 0;
+    const bool wide = (cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0xA4CF) || (cp >= 0xAC00 && cp <= 0xD7A3) ||
+                      (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFE30 && cp <= 0xFE4F) || (cp >= 0xFF00 && cp <= 0xFF60) ||
+                      (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x1F300 && cp <= 0x1FAFF) || (cp >= 0x20000 && cp <= 0x3FFFD);
+    return wide ? 2 : 1;
+}
+}  // namespace
+
+int width(const std::string& s) {
+    int w = 0;
+    for (size_t i = 0; i < s.size();) {
+        if (s[i] == '\x1b') {  // escape sequence: ESC [ ... final byte
+            size_t j = i + 1;
+            if (j < s.size() && s[j] == '[') {
+                j++;
+                while (j < s.size() && !((uint8_t)s[j] >= 0x40 && (uint8_t)s[j] <= 0x7E)) j++;
+            }
+            i = std::min(j + 1, s.size());
+            continue;
+        }
+        int len;
+        w += cp_width(decode(s, i, len));
+        i += len;
+    }
+    return w;
+}
+
+std::string fit(const std::string& s, int cols) {
+    if (cols <= 0) return "";
+    if (width(s) <= cols) return s;
+    int w = 0;
+    size_t i = 0;
+    while (i < s.size()) {
+        int len;
+        const int cw = cp_width(decode(s, i, len));
+        if (w + cw > cols - 1) break;
+        w += cw;
+        i += len;
+    }
+    return s.substr(0, i) + "\xE2\x80\xA6";
+}
+
+bool interactive() {
+    if (!g_color) return false;
+#ifdef _WIN32
+    DWORD mode;
+    return GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode) != 0;
+#else
+    return isatty(0);
+#endif
+}
+
+namespace {
+enum Key { K_UP = -1, K_DOWN = -2, K_ENTER = -3, K_ESC = -4, K_NONE = 0 };  // digits come back as 1..9
+
+int read_key() {
+#ifdef _WIN32
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    for (;;) {
+        if (g_interrupt.exchange(false)) return K_ESC;
+        if (WaitForSingleObject(h, 50) != WAIT_OBJECT_0) continue;
+        INPUT_RECORD r;
+        DWORD n = 0;
+        if (!ReadConsoleInputW(h, &r, 1, &n) || !n) return K_ESC;
+        if (r.EventType != KEY_EVENT || !r.Event.KeyEvent.bKeyDown) continue;
+        const WORD vk = r.Event.KeyEvent.wVirtualKeyCode;
+        const wchar_t c = r.Event.KeyEvent.uChar.UnicodeChar;
+        if (vk == VK_UP || c == L'k') return K_UP;
+        if (vk == VK_DOWN || c == L'j' || vk == VK_TAB) return K_DOWN;
+        if (vk == VK_RETURN) return K_ENTER;
+        if (vk == VK_ESCAPE || c == L'q' || c == 3) return K_ESC;
+        if (c >= L'1' && c <= L'9') return c - L'0';
+    }
+#else
+    termios old{}, raw{};
+    tcgetattr(0, &old);
+    raw = old;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(0, TCSANOW, &raw);
+    int key = K_NONE;
+    while (key == K_NONE) {
+        unsigned char c;
+        if (read(0, &c, 1) != 1 || g_interrupt.exchange(false)) { key = K_ESC; break; }
+        if (c == 0x1b) {
+            pollfd p{0, POLLIN, 0};
+            unsigned char b[2];
+            if (poll(&p, 1, 30) <= 0) { key = K_ESC; break; }
+            if (read(0, b, 2) == 2 && b[0] == '[') key = b[1] == 'A' ? K_UP : b[1] == 'B' ? K_DOWN : K_NONE;
+        } else if (c == 'k') key = K_UP;
+        else if (c == 'j' || c == '\t') key = K_DOWN;
+        else if (c == '\n' || c == '\r') key = K_ENTER;
+        else if (c == 'q' || c == 3) key = K_ESC;
+        else if (c >= '1' && c <= '9') key = c - '0';
+    }
+    tcsetattr(0, TCSANOW, &old);
+    return key;
+#endif
+}
+}  // namespace
+
+int select(const std::string& title, const std::vector<Choice>& items, int current, const std::function<void(int)>& on_move,
+           const std::function<std::string(int)>& footer) {
+    const int n = (int)items.size();
+    if (!interactive() || n == 0) return -1;
+    int cur = std::clamp(current, 0, n - 1), top = 0, drawn = 0;
+    const int vis = std::min(n, 12);
+    int lw = 0;
+    for (const Choice& c : items) lw = std::max(lw, width(c.label));
+    auto draw = [&] {
+        const Theme& t = theme();
+        const int cols = columns();
+        const std::string off = sgr("0"), dim = sgr(t.dim);
+        if (cur < top) top = cur;
+        if (cur >= top + vis) top = cur - vis + 1;
+        std::string o;
+        if (drawn) o += "\x1b[" + std::to_string(drawn) + "A";
+        o += "\r\x1b[J";
+        int lines = 0;
+        auto line = [&](const std::string& s) {
+            o += s + "\n";
+            lines++;
+        };
+        line(" " + sgr("1") + fit(title, cols - 2) + off);
+        for (int i = top; i < top + vis; i++) {
+            std::string num = std::to_string(i + 1) + ". ";
+            if (n > 9 && i < 9) num = " " + num;  // align one- and two-digit numbers
+            const std::string label = fit(items[i].label, std::max(4, cols - 10));
+            const int used = 3 + (int)num.size() + std::max(lw, width(label)) + 2 + 3;
+            const std::string desc = cols - used > 8 ? fit(items[i].desc, cols - used) : "";
+            const std::string pad((size_t)std::max(0, lw - width(label)) + 2, ' ');
+            line((i == cur ? sgr(t.accent) + " \xE2\x9D\xAF " : "   ") + num + label + off + pad + dim + desc + off +
+                 (i == current ? " " + sgr(t.ok) + "\xE2\x9C\x94" + off : ""));
+        }
+        if (n > vis) line(dim + "   " + std::to_string(cur + 1) + " of " + std::to_string(n) + off);
+        if (footer) {
+            const std::string f = footer(cur);
+            o += f;
+            lines += (int)std::count(f.begin(), f.end(), '\n');
+        }
+        line(dim + " \xE2\x86\x91/\xE2\x86\x93 move \xC2\xB7 Enter select \xC2\xB7 1-9 pick \xC2\xB7 Esc cancel" + off);
+        drawn = lines;
+        std::fputs(o.c_str(), stdout);
+        std::fflush(stdout);
+    };
+    std::fputs("\x1b[?25l", stdout);
+    int result = -1;
+    for (;;) {
+        draw();
+        const int k = read_key();
+        const int before = cur;
+        if (k == K_UP) cur = (cur + n - 1) % n;
+        else if (k == K_DOWN) cur = (cur + 1) % n;
+        else if (k == K_ENTER) { result = cur; break; }
+        else if (k == K_ESC) break;
+        else if (k >= 1 && k <= 9 && k <= n) { result = k - 1; break; }
+        if (cur != before && on_move) on_move(cur);
+    }
+    std::printf("\x1b[%dA\r\x1b[J\x1b[?25h", drawn);
+    std::fflush(stdout);
+    return result;
+}
 
 Input read_message(const std::string& prompt, std::string& out) {
     out.clear();
@@ -202,13 +431,54 @@ void Utf8Out::flush() {
 // ---------------------------------------------------------------------------------------------
 
 std::string Markdown::style() const {
+    const Theme& t = theme();
     std::string s = "\x1b[0";
-    if (dim_) s += ";2";
-    if (fence_) s += ";36";
-    if (heading_) s += ";1;35";
+    auto add = [&](const char* code) {
+        if (*code) s += std::string(";") + code;
+    };
+    if (dim_) add(t.dim);  // the reasoning stays one faint color
+    else {
+        if (fence_) add(t.fence);
+        if (heading_) add(t.heading);
+        if (code_) add(t.code);
+    }
     if (bold_) s += ";1";
-    if (code_) s += ";33";
     return s + "m";
+}
+
+// Puts the prefix in front of each line's first visible character (escape sequences pass through; the style
+// in force, always a full "reset + attributes" sequence, is restored after the prefix).
+std::string Markdown::indent(const std::string& o) {
+    if (pfx_first_.empty() && pfx_rest_.empty()) return o;
+    std::string r;
+    for (char c : o) {
+        if (in_esc_) {
+            cur_esc_ += c;
+            r += c;
+            if (cur_esc_.size() > 2 && (uint8_t)c >= 0x40 && (uint8_t)c <= 0x7E) {
+                in_esc_ = false;
+                last_esc_ = cur_esc_;
+            }
+            continue;
+        }
+        if (c == '\x1b') {
+            in_esc_ = true;
+            cur_esc_ = c;
+            r += c;
+            continue;
+        }
+        if (c == '\n') {
+            need_pfx_ = true;
+            r += c;
+            continue;
+        }
+        if (need_pfx_) {
+            r += "\x1b[0m" + (first_line_ ? pfx_first_ : pfx_rest_) + last_esc_;
+            need_pfx_ = first_line_ = false;
+        }
+        r += c;
+    }
+    return r;
 }
 
 void Markdown::put(const std::string& text) {
@@ -222,7 +492,7 @@ void Markdown::put(const std::string& text) {
         o += style();
     }
     for (char c : text) ch(c, o);
-    out_.put(o);
+    out_.put(indent(o));
 }
 
 void Markdown::finish() {
@@ -243,9 +513,12 @@ void Markdown::finish() {
     bol_ = true;
     fence_ = fence_line_ = code_ = bold_ = star_ = heading_ = false;
     started_ = false;
-    if (on_) o += "\x1b[0m";
-    out_.put(o);
+    o += "\x1b[0m";
+    out_.put(indent(o));
     out_.flush();
+    need_pfx_ = first_line_ = true;
+    in_esc_ = false;
+    last_esc_.clear();
 }
 
 void Markdown::ch(char c, std::string& o) {
@@ -256,7 +529,7 @@ void Markdown::ch(char c, std::string& o) {
         }
         fence_ = !fence_;
         fence_line_ = false;
-        o += "\x1b[0;2m" + hold_ + "\n" + style();
+        o += "\x1b[0m" + sgr(theme().dim) + hold_ + "\n" + style();
         hold_.clear();
         bol_ = true;
         return;
@@ -311,7 +584,7 @@ void Markdown::line_start(std::string& o) {
     if (r[0] == '-' || r[0] == '*' || r[0] == '+') {
         if (r.size() == 1) return;
         if (r[1] == ' ') {
-            o += indent + "\x1b[0;36m" + "\xE2\x80\xA2" + style() + " ";  // bullet
+            o += indent + "\x1b[0m" + sgr(theme().accent) + "\xE2\x80\xA2" + style() + " ";  // bullet
             hold_.clear();
             bol_ = false;
             return;
@@ -364,8 +637,8 @@ void Spinner::update(int tokens) {
     static const char* frames[] = {"\xE2\xA0\x8B", "\xE2\xA0\x99", "\xE2\xA0\xB9", "\xE2\xA0\xB8", "\xE2\xA0\xBC",
                                    "\xE2\xA0\xB4", "\xE2\xA0\xA6", "\xE2\xA0\xA7", "\xE2\xA0\x87", "\xE2\xA0\x8F"};
     frame_ = (frame_ + 1) % 10;
-    std::printf("\r\x1b[0;36m%s\x1b[0;2m %s %.0fs \xC2\xB7 %d tokens \xC2\xB7 Ctrl+C to stop\x1b[0m\x1b[K",
-                frames[frame_], label_.c_str(), seconds(), tokens);
+    std::printf("\r\x1b[0m%s%s\x1b[0m%s %s\xE2\x80\xA6 (%.0fs \xC2\xB7 %d tokens \xC2\xB7 Ctrl+C to stop)\x1b[0m\x1b[K",
+                sgr(theme().accent).c_str(), frames[frame_], sgr(theme().dim).c_str(), label_.c_str(), seconds(), tokens);
     std::fflush(stdout);
     drawn_ = true;
 }

@@ -9,3 +9,7 @@ struct MemoryStats {
 };
 
 MemoryStats memory_stats();
+
+// Dedicated video memory in use by ALL programs on the adapter with this LUID (bytes), or -1 if unknown.
+// (Vulkan's memory budget only reports this process's use; this is what tells us how full the card really is.)
+long long gpu_dedicated_used(unsigned luid_low, long luid_high);

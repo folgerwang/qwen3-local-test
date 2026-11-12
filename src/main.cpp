@@ -7,6 +7,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <iterator>
 #include <iostream>
@@ -60,42 +61,158 @@ struct Options {
     bool no_vision = false;
     bool no_tools = false;
     std::string permission = "ask";  // ask | edits | all | read-only
-    double vram_reserve_gb = 3.0;    // VRAM left free for other programs
+    double vram_reserve_gb = 5.0;    // VRAM left free for other programs
     double ram_reserve_gb = 16.0;    // RAM left free (experts are not pinned if that would cut into it)
+    std::string first_msg;           // positional prompt: sent as the first message of the interactive chat
+    bool print = false;              // -p: answer `prompt` and exit
+    std::string theme;               // --theme (otherwise the saved one)
+    bool resume_pick = false;        // --resume without a name: choose from a menu
 };
+
+constexpr const char* kVersion = "0.3.0";
 
 void usage() {
     std::printf(
-        "usage: qwen [options]\n"
-        "  --model DIR          model directory (default models/Qwen3.6-35B-A3B-FP8)\n"
-        "  --backend cpu|vulkan inference backend (default cpu)\n"
-        "  -p, --prompt TEXT    single prompt, then exit (otherwise interactive chat)\n"
-        "  -f, --prompt-file F  read the single prompt from a file\n"
-        "  --system TEXT        system prompt\n"
-        "  --no-think           disable thinking mode\n"
-        "  --hide-think         don't print the reasoning, show a spinner instead (/think toggles)\n"
-        "  -c, --continue       resume the last conversation with this model\n"
-        "  --resume NAME        resume a saved conversation (see /save in the chat)\n"
-        "  --keep-think         keep earlier turns' reasoning in the history (default: as the model's template)\n"
-        "  --drop-think         drop earlier turns' reasoning from the history\n"
-        "  --effort LEVEL       reasoning effort for Qwen3.8-Flash-Next: xhigh (default), medium, low\n"
-        "  -n N                 max new tokens per reply (default 4096)\n"
-        "  --ctx N              context length (default 32768)\n"
-        "  --temp T --top-k K --top-p P --seed S --greedy\n"
-        "  --threads N          CPU threads (default: all)\n"
-        "  --expert-cache MB    GPU expert cache size (vulkan, default: all VRAM but the reserve)\n"
-        "  --vram-reserve GB    VRAM left free for other programs (default 3)\n"
-        "  --ram-reserve GB     RAM left free; if pinning the experts would cut into it, the CPU runs uncached\n"
-        "                       experts instead (slower) (default 16)\n"
-        "  --image FILE         attach an image to the -p prompt (repeatable; vulkan backend)\n"
-        "  --image-tokens N     largest image size in tokens, 32x32 pixels each (default 1024)\n"
-        "  --no-vision          don't load the vision tower (frees ~1 GB of VRAM for the expert cache)\n"
-        "  --no-tools           no tools (files in the working folder, PowerShell commands, web search)\n"
-        "  --permission MODE    ask (default: changes and commands ask first), edits (file changes allowed, commands\n"
-        "                       ask), all (nothing asks), read-only (changes and commands refused)\n"
-        "  --tokenize TEXT      print token ids and exit\n"
-        "  --eval IDS           comma-separated ids: run and print top-10 logits of last position\n"
-        "                       (with --image, the image token id marks where the image goes)\n");
+        "Usage: qwen [options] [prompt]\n"
+        "\n"
+        "  qwen                      start an interactive chat\n"
+        "  qwen \"question\"           start a chat with a first message\n"
+        "  qwen -p \"question\"        answer and exit (also reads the prompt from a pipe: type file | qwen -p)\n"
+        "  qwen -c                   continue the last conversation\n"
+        "\n"
+        "Session\n"
+        "  -p, --print [TEXT]        print the answer to TEXT (or to piped input) and exit\n"
+        "  -f, --prompt-file FILE    like -p, with the prompt read from a file\n"
+        "  -c, --continue            resume the last conversation with this model\n"
+        "  -r, --resume [NAME]       resume a saved conversation; without a name, choose from a menu\n"
+        "  --system-prompt TEXT      system prompt (also --system, --append-system-prompt)\n"
+        "  --image FILE              attach an image to the -p prompt (repeatable; vulkan backend)\n"
+        "\n"
+        "Model\n"
+        "  --model NAME|DIR          model folder, or part of a downloaded model's name (35b, 122b, flash)\n"
+        "  --backend cpu|vulkan      inference backend (default cpu)\n"
+        "  --ctx N                   context length (default 32768)\n"
+        "  --effort LEVEL            reasoning effort for Qwen3.8-Flash-Next: xhigh (default), medium, low\n"
+        "  --no-think                turn thinking off\n"
+        "  --hide-think              show a spinner instead of the reasoning (/think toggles)\n"
+        "  --keep-think, --drop-think  keep / drop earlier turns' reasoning in the history (default: the model's template)\n"
+        "\n"
+        "Sampling\n"
+        "  -n, --max-tokens N        max new tokens per reply (default 4096)\n"
+        "  --temp T  --top-k K  --top-p P  --seed S  --greedy\n"
+        "\n"
+        "Tools and permissions\n"
+        "  --permission-mode MODE    ask (default: changes and commands ask first), edits (file changes allowed,\n"
+        "                            commands ask), all (nothing asks), read-only (changes and commands refused).\n"
+        "                            Also accepted: default, acceptEdits, bypassPermissions, plan; and --permission\n"
+        "  --dangerously-skip-permissions   same as --permission-mode all\n"
+        "  --no-tools                no tools (files in the working folder, PowerShell commands, web search)\n"
+        "\n"
+        "Appearance\n"
+        "  --theme NAME              dark, light, dark-colorblind, light-colorblind, ansi, mono (/theme in the chat)\n"
+        "\n"
+        "Memory\n"
+        "  --vram-reserve GB         VRAM left free for other programs (default 5)\n"
+        "  --ram-reserve GB          RAM left free; if pinning the experts would cut into it, the CPU runs uncached\n"
+        "                            experts instead (slower) (default 16)\n"
+        "  --expert-cache MB         fixed GPU expert cache size (default: all VRAM but the reserve)\n"
+        "  --image-tokens N          largest image size in tokens, 32x32 pixels each (default 1024)\n"
+        "  --no-vision               don't load the vision tower (frees ~1 GB of VRAM for the expert cache)\n"
+        "  --threads N               CPU threads (default: all)\n"
+        "\n"
+        "Other\n"
+        "  --tokenize TEXT           print token ids and exit\n"
+        "  --eval IDS                comma-separated ids: run and print top-10 logits of the last position\n"
+        "                            (with --image, the image token id marks where the image goes)\n"
+        "  --tool NAME key=value...  run one tool directly\n"
+        "  -v, --version             print the version\n"
+        "  -h, --help                this help\n"
+        "\n"
+        "In the chat, /help lists the commands, / opens the command menu and /config the settings.\n");
+}
+
+// User settings that outlive a session (~/.qwen/settings.json): currently the theme.
+fs::path settings_path() {
+    const char* home = std::getenv("USERPROFILE");
+    if (!home) home = std::getenv("HOME");
+    return home ? fs::path(home) / ".qwen" / "settings.json" : fs::path();
+}
+std::string load_saved_theme() {
+    try {
+        std::ifstream f(settings_path(), std::ios::binary);
+        if (!f) return "";
+        const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        const json::Value v = json::parse(text);
+        if (const json::Value* t = v.find("theme")) return t->as_str();
+    } catch (...) {
+    }
+    return "";
+}
+void save_theme(const std::string& name) {
+    const fs::path p = settings_path();
+    if (p.empty()) return;
+    std::error_code ec;
+    fs::create_directories(p.parent_path(), ec);
+    std::ofstream(p, std::ios::binary) << "{\"theme\":\"" << name << "\"}\n";
+}
+
+// A few lines in the current theme, shown under the theme menu.
+std::string theme_sample() {
+    const term::Theme& t = term::theme();
+    const std::string off = term::sgr("0");
+    return "\n   " + term::sgr(t.accent) + "\xE2\x97\x8F" + off + " An answer with " + term::sgr("1") + "bold" + off + " text and " +
+           term::sgr(t.code) + "inline code" + off + "\n     " + term::sgr(t.heading) + "A heading" + off + "   " + term::sgr(t.dim) +
+           "faint text, like the reasoning" + off + "\n     " + term::sgr(t.fence) + "int main() { return 0; }" + off + "\n     " +
+           term::sgr(t.ok) + "+ added line" + off + "   " + term::sgr(t.err) + "- removed line" + off + "   " + term::sgr(t.warn) +
+           "needs approval" + off + "\n\n";
+}
+
+// Theme menu with a live preview; returns false when cancelled (the previous theme is then restored).
+bool pick_theme(const std::string& title) {
+    const std::string before = term::theme().name;
+    std::vector<term::Choice> items;
+    int cur = 0;
+    for (size_t i = 0; i < term::themes().size(); i++) {
+        items.push_back({term::themes()[i].name, term::themes()[i].desc});
+        if (before == term::themes()[i].name) cur = (int)i;
+    }
+    const int idx = term::select(title, items, cur, [&](int i) { term::set_theme(items[i].label); }, [](int) { return theme_sample(); });
+    term::set_theme(idx < 0 ? before : items[idx].label);
+    if (idx >= 0) save_theme(items[idx].label);
+    return idx >= 0;
+}
+
+// --model: a folder with a config.json, or part of the name of a model folder under models/ (next to the
+// program's project, or in the working folder).
+std::string resolve_model(const std::string& arg, const char* argv0) {
+    std::error_code ec;
+    if (fs::exists(fs::path(arg) / "config.json", ec)) return arg;
+    std::string q = fs::path(arg).filename().string();
+    for (char& c : q) c = (char)std::tolower((unsigned char)c);
+    const fs::path exe = fs::absolute(fs::path(argv0), ec).parent_path();
+    for (const fs::path& root : {fs::path("models"), exe / "models", exe / ".." / ".." / "models"}) {
+        std::vector<std::string> hits;
+        for (auto& e : fs::directory_iterator(root, ec)) {
+            if (!fs::exists(e.path() / "config.json", ec)) continue;
+            std::string n = e.path().filename().string();
+            for (char& c : n) c = (char)std::tolower((unsigned char)c);
+            if (n == q) return e.path().string();
+            if (n.find(q) != std::string::npos) hits.push_back(e.path().string());
+        }
+        if (hits.size() > 1) {  // several quantizations of one model: the FP8 one
+            std::vector<std::string> fp8;
+            for (auto& h : hits)
+                if (h.size() > 4 && (h.compare(h.size() - 4, 4, "-FP8") == 0 || h.compare(h.size() - 4, 4, "-fp8") == 0)) fp8.push_back(h);
+            if (fp8.size() == 1) hits = fp8;
+        }
+        if (hits.size() == 1) return hits[0];
+        if (hits.size() > 1) {
+            std::string l;
+            for (auto& h : hits) l += (l.empty() ? "" : ", ") + fs::path(h).filename().string();
+            throw std::runtime_error("--model " + arg + " matches several models: " + l);
+        }
+    }
+    return arg;  // let the loader report it
 }
 
 // A conversation: every token fed to the backend (re-fed to restore it) plus the visible turns.
@@ -165,6 +282,14 @@ std::string clean_name(std::string s) {
     for (char& c : s)
         if (!std::isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') c = '_';
     return s;
+}
+
+// Model folder name without its weight-format suffix.
+std::string short_name_of(std::string n) {
+    for (const char* suf : {"-FP8", "-fp8", "-BF16"})
+        if (n.size() > std::strlen(suf) && n.compare(n.size() - std::strlen(suf), std::string::npos, suf) == 0)
+            n.resize(n.size() - std::strlen(suf));
+    return n;
 }
 
 std::string thousands(long long v) {
@@ -288,21 +413,48 @@ int main(int argc, char** argv) {
     } flush_at_exit;
     term::init();
     Options o;
+    if (const std::string saved = load_saved_theme(); !saved.empty()) term::set_theme(saved);
+    const bool first_run = load_saved_theme().empty();
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
             if (i + 1 >= argc) { std::fprintf(stderr, "missing value for %s\n", a.c_str()); std::exit(1); }
             return argv[++i];
         };
-        if (a == "--model") o.model_dir = next();
+        // a value that may be left out: the next argument unless it is another option
+        auto has_value = [&] { return i + 1 < argc && argv[i + 1][0] != '-'; };
+        if (a == "--model") {
+            try {
+                o.model_dir = resolve_model(next(), argv[0]);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "%s\n", e.what());
+                return 1;
+            }
+        }
         else if (a == "--backend") o.backend = next();
-        else if (a == "-p" || a == "--prompt") o.prompt = next();
+        else if (a == "-p" || a == "--print" || a == "--prompt") {
+            o.print = true;
+            if (has_value()) o.prompt = next();
+        }
         else if (a == "-f" || a == "--prompt-file") {
             std::ifstream f(next(), std::ios::binary);
             if (!f) { std::fprintf(stderr, "cannot read prompt file\n"); return 1; }
             o.prompt.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            o.print = true;
         }
-        else if (a == "--system") o.system = next();
+        else if (a == "--system" || a == "--system-prompt" || a == "--append-system-prompt") o.system = next();
+        else if (a == "--max-tokens") o.max_new = std::stoi(next());
+        else if (a == "--theme") {
+            o.theme = next();
+            if (!term::set_theme(o.theme)) {
+                std::fprintf(stderr, "--theme must be one of:");
+                for (auto& t : term::themes()) std::fprintf(stderr, " %s", t.name);
+                std::fprintf(stderr, "\n");
+                return 1;
+            }
+        }
+        else if (a == "-v" || a == "--version") { std::printf("qwen %s\n", kVersion); return 0; }
+        else if (a == "--dangerously-skip-permissions") o.permission = "all";
         else if (a == "--no-think") o.think = false;
         else if (a == "--keep-think") o.keep_think = 1;
         else if (a == "--drop-think") o.keep_think = 0;
@@ -322,15 +474,22 @@ int main(int argc, char** argv) {
         else if (a == "--no-hybrid") o.hybrid = 0;
         else if (a == "--no-stats") o.no_stats = true;
         else if (a == "-c" || a == "--continue") o.resume = "last";
-        else if (a == "--resume") o.resume = next();
+        else if (a == "-r" || a == "--resume") {
+            if (has_value()) o.resume = next();
+            else o.resume_pick = true;
+        }
         else if (a == "--image") o.images.push_back(next());
         else if (a == "--image-tokens") o.image_tokens = std::max(64, std::stoi(next()));
         else if (a == "--no-vision") o.no_vision = true;
         else if (a == "--no-tools") o.no_tools = true;
         else if (a == "--vram-reserve") o.vram_reserve_gb = std::max(0.0, std::stod(next()));
         else if (a == "--ram-reserve") o.ram_reserve_gb = std::max(0.0, std::stod(next()));
-        else if (a == "--permission") {
+        else if (a == "--permission" || a == "--permission-mode") {
             o.permission = next();
+            if (o.permission == "default") o.permission = "ask";
+            else if (o.permission == "acceptEdits") o.permission = "edits";
+            else if (o.permission == "bypassPermissions") o.permission = "all";
+            else if (o.permission == "plan") o.permission = "read-only";
             if (o.permission != "ask" && o.permission != "edits" && o.permission != "all" && o.permission != "read-only") {
                 std::fprintf(stderr, "--permission must be ask, edits, all or read-only\n");
                 return 1;
@@ -360,7 +519,23 @@ int main(int argc, char** argv) {
         else if (a == "--eval") o.eval_ids = next();
         else if (a == "--eval-split") o.eval_split = std::stoi(next());
         else if (a == "-h" || a == "--help") { usage(); return 0; }
-        else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); usage(); return 1; }
+        else if (a[0] != '-' && o.first_msg.empty()) o.first_msg = a;
+        else { std::fprintf(stderr, "unknown option %s (qwen --help lists them)\n", a.c_str()); return 1; }
+    }
+    if (o.print && o.prompt.empty()) {  // qwen -p "text" also parses as a positional prompt; else read a pipe
+        o.prompt = o.first_msg;
+        if (o.prompt.empty() && !term::interactive())
+            o.prompt.assign(std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>());
+        if (o.prompt.find_first_not_of(" \t\r\n") == std::string::npos) {
+            std::fprintf(stderr, "-p needs a prompt: qwen -p \"question\", or pipe one in\n");
+            return 1;
+        }
+    }
+    // first interactive start: choose the theme (saved in ~/.qwen/settings.json; /theme changes it)
+    const bool special = !o.tokenize.empty() || !o.tokenize_file.empty() || !o.eval_ids.empty();
+    if (first_run && o.theme.empty() && !o.print && !special && term::interactive()) {
+        std::printf("\n");
+        pick_theme("Choose the text style that looks best in your terminal (change it later with /theme)");
     }
 
     try {
@@ -395,6 +570,7 @@ int main(int argc, char** argv) {
             cfg = Config::load(o.model_dir);
             tok = Tokenizer();
             tok.load(o.model_dir);
+            if (cfg.expert_q4 && o.backend == "cpu") throw std::runtime_error("4-bit (GPTQ) models need --backend vulkan");
             st = SafeTensors(o.model_dir);
             w.load(st, cfg);
             if (o.backend == "cpu") be = make_cpu_backend(cfg, w, o.max_ctx, o.threads);
@@ -501,7 +677,19 @@ int main(int argc, char** argv) {
         };
         refresh_model();
         const bool ui = term::color();
-        const std::string dim = term::sgr("2"), off = term::sgr("0"), red = term::sgr("31");
+        // role colors of the current theme (apply_theme() refreshes them after /theme)
+        const std::string off = term::sgr("0"), bold = term::sgr("1");
+        std::string dim, red, cyan, green, yellow, accent_b;
+        auto apply_theme = [&] {
+            const term::Theme& t = term::theme();
+            dim = term::sgr(t.dim);
+            red = term::sgr(t.err);
+            cyan = term::sgr(t.accent);
+            green = term::sgr(t.ok);
+            yellow = term::sgr(t.warn);
+            accent_b = bold + cyan;
+        };
+        apply_theme();
 
         // The conversation is mirrored token by token as it is fed, so it can be saved and re-fed later.
         Session sess;
@@ -549,7 +737,6 @@ int main(int argc, char** argv) {
         bool tools_on = !o.no_tools;
         std::set<std::string> always_allow;  // tools the user allowed for the rest of the session
         bool abort_turn = false;              // Ctrl+C at an approval prompt
-        const std::string cyan = term::sgr("36"), green = term::sgr("32"), yellow = term::sgr("33");
         const Tools::Approver approver = [&](const std::string& tool, const std::string& title, const std::string& preview,
                                              std::string& note) {
             if (abort_turn) return false;
@@ -564,7 +751,7 @@ int main(int argc, char** argv) {
                                    : o.permission == "edits" && is_edit ? "permission: edits"
                                    : always_allow.count(tool) ? "allowed for this session"
                                                               : nullptr;
-            std::printf("    %s%s%s\n", yellow.c_str(), title.c_str(), off.c_str());
+            std::printf("  %s\xE2\x8E\xBF%s  %s%s%s\n", dim.c_str(), off.c_str(), yellow.c_str(), title.c_str(), off.c_str());
             size_t a = 0;
             int shown_lines = 0;
             while (a <= preview.size() && shown_lines < 40) {
@@ -581,8 +768,30 @@ int main(int argc, char** argv) {
                 return true;
             }
             std::string ans;
-            const term::Input r = term::read_message("    " + term::sgr("1") + "allow?" + off + " " + dim + "[y]es / [n]o / [a]lways for " +
-                                                         tool + " / or type what to do instead" + off + " " + term::sgr("1") + "\xE2\x80\xBA " + off,
+            if (term::interactive()) {  // a menu, as long as there is a terminal to show it on
+                const int pick = term::select("Do you want to allow this?",
+                                              {{"Yes", ""},
+                                               {"Yes, and don't ask again for " + tool + " this session", ""},
+                                               {"No", "the model is told you declined"},
+                                               {"No, and tell the model what to do instead", ""}},
+                                              -1);
+                if (pick == 0) return true;
+                if (pick == 1) {
+                    always_allow.insert(tool);
+                    return true;
+                }
+                if (pick == 2) return false;
+                if (pick < 0) {  // Esc / Ctrl+C: stop the turn
+                    abort_turn = true;
+                    return false;
+                }
+                const term::Input r = term::read_message("    " + dim + "what should it do instead?" + off + " " + accent_b + "\xE2\x9D\xAF " + off, ans);
+                if (r == term::Input::Cancel) abort_turn = true;
+                else note = ans;
+                return false;
+            }
+            const term::Input r = term::read_message("    " + bold + "allow?" + off + " " + dim + "[y]es / [n]o / [a]lways for " +
+                                                         tool + " / or type what to do instead" + off + " " + bold + "\xE2\x80\xBA " + off,
                                                      ans);
             if (r == term::Input::Cancel) {
                 abort_turn = true;
@@ -614,7 +823,9 @@ int main(int argc, char** argv) {
             const bool hide = o.hide_think;
             bool thinking = o.think;
             term::Markdown thought(ui, true), answer(ui);
-            term::Spinner spin(ui && hide);
+            answer.prefix(cyan + "\xE2\x97\x8F" + off + " ", "  ");    // ● answer, later lines indented under it
+            thought.prefix(dim + "\xE2\x9C\xBB" + off + " ", "  ");    // ✻ reasoning
+            term::Spinner spin(ui && hide, "Thinking");
             if (thinking && !ui && !hide) std::printf("<think>\n");
             std::string& text = g.text;
             size_t shown = 0;     // bytes of `text` displayed or skipped so far
@@ -663,7 +874,7 @@ int main(int argc, char** argv) {
                         shown = g.answer_at = p + end_tag.size();
                         if (hide) {
                             spin.clear();
-                            if (ui) std::printf("%s\xE2\x97\xA6 thought for %.0fs (%d tokens)%s\n\n", dim.c_str(), spin.seconds(), n_think, off.c_str());
+                            if (ui) std::printf("%s\xE2\x9C\xBB Thought for %.0fs (%d tokens)%s\n\n", dim.c_str(), spin.seconds(), n_think, off.c_str());
                         } else {
                             thought.finish();
                             std::fputs(ui ? "\n\n" : end_tag.c_str(), stdout);
@@ -806,9 +1017,10 @@ int main(int argc, char** argv) {
                 used_tools = true;
                 feed({im_end});
                 feed(tok.encode("\n<|im_start|>user"));
+                if (g.shown_answer) std::printf("\n");
                 for (const ToolCall& call : calls) {
                     n_calls++;
-                    std::printf("  %s\xE2\x96\xB8%s %s\n", cyan.c_str(), off.c_str(), tools.describe(call).c_str());
+                    std::printf("%s\xE2\x97\x8F%s %s%s%s\n", green.c_str(), off.c_str(), bold.c_str(), tools.describe(call).c_str(), off.c_str());
                     ToolResult r;
                     std::string key = call.name;
                     for (auto& [k, v] : call.args) key += "\x1f" + k + "=" + v;
@@ -843,7 +1055,8 @@ int main(int argc, char** argv) {
                         for (size_t i = from; i < lines.size(); i++)
                             std::printf("    %s\xE2\x94\x82 %s%s\n", dim.c_str(), lines[i].substr(0, 200).c_str(), off.c_str());
                     }
-                    std::printf("    %s\xE2\x86\xB3 %s%s%s\n", dim.c_str(), r.ok ? "" : red.c_str(), r.summary.c_str(), off.c_str());
+                    std::printf("  %s\xE2\x8E\xBF  %s%s%s\n", dim.c_str(), r.ok ? "" : red.c_str(), r.summary.c_str(), off.c_str());
+                    std::printf("\n");
                     std::fflush(stdout);
                     feed(tok.encode("\n<tool_response>\n"));
                     if (!r.image.empty()) {
@@ -895,7 +1108,7 @@ int main(int argc, char** argv) {
             const double tps = n_gen / std::max(gen_s, 1e-9);
             const std::string calls_s = n_calls ? " \xC2\xB7 " + std::to_string(n_calls) + (n_calls == 1 ? " tool call" : " tool calls") : "";
             if (ui)
-                std::fprintf(stderr, "%s%d tokens \xC2\xB7 %.1f tok/s%s \xC2\xB7 prompt %zu tokens at %.0f tok/s \xC2\xB7 context %s / %s%s\n",
+                std::fprintf(stderr, "\n%s  %d tokens \xC2\xB7 %.1f tok/s%s \xC2\xB7 prompt %zu tokens at %.0f tok/s \xC2\xB7 context %s / %s%s\n",
                              dim.c_str(), n_gen, tps, calls_s.c_str(), n_prefill, n_prefill / prefill_s, thousands(be->pos()).c_str(),
                              thousands(be->max_ctx()).c_str(), off.c_str());
             else
@@ -986,6 +1199,16 @@ int main(int argc, char** argv) {
                 std::printf("%scould not save the conversation: %s%s\n", red.c_str(), e.what(), off.c_str());
             }
         };
+        auto session_names = [&] {  // saved conversations, newest first
+            std::vector<std::pair<fs::file_time_type, std::string>> v;
+            std::error_code ec;
+            for (auto& e : fs::directory_iterator(session_dir, ec))
+                if (e.path().extension() == ".json") v.push_back({e.last_write_time(), e.path().stem().string()});
+            std::sort(v.rbegin(), v.rend());
+            std::vector<std::string> names;
+            for (auto& [t, n] : v) names.push_back(n);
+            return names;
+        };
         auto list_sessions = [&] {
             std::vector<std::pair<fs::file_time_type, std::string>> v;
             std::error_code ec;
@@ -1035,7 +1258,7 @@ int main(int argc, char** argv) {
             if (!sess.turns.empty()) {  // remind of where the conversation left off
                 const auto& last = sess.turns.back();
                 std::string u = last.user.size() > 300 ? last.user.substr(0, 300) + "..." : last.user;
-                std::printf("\n%s> %s%s\n\n", term::sgr("1;32").c_str(), off.c_str(), u.c_str());
+                std::printf("\n%s\xE2\x9D\xAF %s%s\n\n", accent_b.c_str(), off.c_str(), u.c_str());
                 term::Markdown md(ui);
                 md.put(last.assistant.size() > 1500 ? last.assistant.substr(0, 1500) + "\n..." : last.assistant);
                 md.finish();
@@ -1047,7 +1270,7 @@ int main(int argc, char** argv) {
             std::error_code ec;
             const fs::path cwd = fs::current_path(ec);
             std::printf("  %smodel%s    %s%s%s %s(%s \xC2\xB7 context %s \xC2\xB7 reasoning %s)%s\n", dim.c_str(), off.c_str(),
-                        term::sgr("1").c_str(), model_name.c_str(), off.c_str(), dim.c_str(), be->name(),
+                        bold.c_str(), model_name.c_str(), off.c_str(), dim.c_str(), be->name(),
                         thousands(be->max_ctx()).c_str(), !o.think ? "off" : o.hide_think ? "on, hidden" : "on", off.c_str());
             std::printf("  %sweights%s  %s%s%s\n", dim.c_str(), off.c_str(), cyan.c_str(), u8str(model_path).c_str(), off.c_str());
             std::printf("  %sfolder%s   %s%s%s\n", dim.c_str(), off.c_str(), cyan.c_str(), u8str(cwd).c_str(), off.c_str());
@@ -1077,11 +1300,47 @@ int main(int argc, char** argv) {
                 std::printf("           %s %s(reserve %.1f GB)%s\n", be->memory_report().c_str(), dim.c_str(), o.vram_reserve_gb, off.c_str());
         };
 
+        // Welcome box: what is running and where (/info has the details).
+        auto banner = [&] {
+            if (!ui) {
+                info();
+                return;
+            }
+            std::error_code ec;
+            const int inner = std::max(30, std::min(term::columns() - 6, 76));  // columns between the borders
+            std::vector<std::pair<std::string, std::string>> rows = {  // (plain text, styled text)
+                {"\xE2\x9C\xBB Welcome to qwen", cyan + "\xE2\x9C\xBB" + off + " Welcome to " + bold + "qwen" + off},
+                {"", ""},
+            };
+            auto row = [&](const std::string& key, const std::string& value, const std::string& extra) {
+                const std::string v = term::fit(value, inner - 12 - term::width(extra));
+                rows.push_back({"  " + key + v + extra, "  " + dim + key + off + v + dim + extra + off});
+            };
+            row("model   ", short_name_of(model_name), std::string(" \xC2\xB7 ") + be->name() + " \xC2\xB7 context " + thousands(be->max_ctx()));
+            row("folder  ", u8str(fs::current_path(ec)), "");
+            row("tools   ", tools_on ? "on \xC2\xB7 permission " + o.permission : "off", "");
+            std::string bar;
+            for (int i = 0; i < inner + 2; i++) bar += "\xE2\x94\x80";
+            std::printf("%s\xE2\x95\xAD%s\xE2\x95\xAE%s\n", cyan.c_str(), bar.c_str(), off.c_str());
+            for (auto& [plain, styled] : rows)
+                std::printf("%s\xE2\x94\x82%s %s%*s %s\xE2\x94\x82%s\n", cyan.c_str(), off.c_str(), styled.c_str(),
+                            std::max(0, inner - term::width(plain)), "", cyan.c_str(), off.c_str());
+            std::printf("%s\xE2\x95\xB0%s\xE2\x95\xAF%s\n", cyan.c_str(), bar.c_str(), off.c_str());
+            std::printf("%s  /help for commands \xC2\xB7 / for the command menu \xC2\xB7 /config for settings \xC2\xB7 Ctrl+C stops a reply%s\n",
+                        dim.c_str(), off.c_str());
+        };
+
         term::catch_ctrl_c(true);
         std::printf("\n");
-        info();
-        std::printf("\n%sEnter sends \xC2\xB7 paste multi-line text freely, or wrap it in \"\"\" \xC2\xB7 Ctrl+C stops a reply \xC2\xB7 /help%s\n",
-                    dim.c_str(), off.c_str());
+        banner();
+        if (o.resume_pick) {  // --resume without a name
+            const std::vector<std::string> names = session_names();
+            std::vector<term::Choice> items;
+            for (auto& n : names) items.push_back({n, ""});
+            const int idx = term::select("Resume which conversation?", items, -1);
+            if (idx >= 0) o.resume = names[idx];
+            else if (names.empty()) std::printf("%sno saved conversations yet%s\n", dim.c_str(), off.c_str());
+        }
         if (!o.resume.empty()) {
             try {
                 resume(o.resume);
@@ -1096,12 +1355,7 @@ int main(int argc, char** argv) {
         };
 
         // ---- models and settings ------------------------------------------------------------------------
-        auto short_name = [](std::string n) {
-            for (const char* suf : {"-FP8", "-fp8", "-BF16"})
-                if (n.size() > std::strlen(suf) && n.compare(n.size() - std::strlen(suf), std::string::npos, suf) == 0)
-                    n.resize(n.size() - std::strlen(suf));
-            return n;
-        };
+        auto short_name = [](const std::string& n) { return short_name_of(n); };
         // Model folders next to the current one: (name, "" if usable, else why not)
         auto available_models = [&]() {
             std::vector<std::pair<std::string, std::string>> v;
@@ -1165,7 +1419,7 @@ int main(int argc, char** argv) {
             tools.set_images(be->has_vision());
             sess.tokens.clear();
             sess.images.clear();
-            std::printf("%snow using %s%s%s\n", dim.c_str(), term::sgr("1").c_str(), short_name(model_name).c_str(), off.c_str());
+            std::printf("%snow using %s%s%s\n", dim.c_str(), bold.c_str(), short_name(model_name).c_str(), off.c_str());
         };
         auto set_title = [&] {
             if (!ui) return;
@@ -1175,7 +1429,7 @@ int main(int argc, char** argv) {
         // Status line shown above each prompt: model, backend, context, permission, reasoning.
         auto status_line = [&]() {
             const std::string sep = dim + " \xC2\xB7 " + off;
-            std::string s = dim + "\xE2\x94\x80 " + off + term::sgr("1;36") + short_name(model_name) + off + sep + dim + be->name() + off + sep +
+            std::string s = dim + "\xE2\x94\x80 " + off + accent_b + short_name(model_name) + off + sep + dim + be->name() + off + sep +
                             dim + "context " + thousands(be->pos()) + " / " + thousands(be->max_ctx()) + off;
             if (tools_on) s += sep + dim + "permission " + off + (o.permission == "ask" ? dim : yellow) + o.permission + off;
             else s += sep + dim + "tools off" + off;
@@ -1204,13 +1458,406 @@ int main(int argc, char** argv) {
             row("system prompt", sess.system.empty() ? "(none)" : utf8_cut(sess.system, 28), "/system TEXT");
         };
         set_title();
+        // Runs one slash command; false = quit. (/config and the command menu call it too.)
+        bool in_config = false;  // inside the /config menu: commands skip their closing printouts
+        std::function<bool(std::string)> command = [&](std::string line) -> bool {
+            const size_t sp = line.find_first_of(" \t");
+            const std::string cmd = line.substr(0, sp);
+            const size_t a0 = sp == std::string::npos ? std::string::npos : line.find_first_not_of(" \t", sp);
+            std::string arg = a0 == std::string::npos ? "" : line.substr(a0);
+            while (!arg.empty() && std::isspace((unsigned char)arg.back())) arg.pop_back();
+            const bool menus = term::interactive();
+            try {
+                if (cmd == "/exit" || cmd == "/quit") return false;
+                else if (cmd == "/") {  // the command menu
+                    static const std::vector<term::Choice> cmds = {
+                        {"/config", "all settings, in a menu"},
+                        {"/model", "switch to another model"},
+                        {"/theme", "colors of the chat"},
+                        {"/permission", "how tool actions are approved"},
+                        {"/new", "start a new conversation"},
+                        {"/load", "resume a saved conversation"},
+                        {"/save", "save this conversation"},
+                        {"/compact", "summarize the conversation into a fresh context"},
+                        {"/think", "show / hide the reasoning"},
+                        {"/undo", "revert the model's last file changes"},
+                        {"/tools", "list the tools"},
+                        {"/init", "have the model write AGENTS.md for this project"},
+                        {"/info", "model, folders and memory use"},
+                        {"/help", "every command"},
+                        {"/exit", "quit"},
+                    };
+                    if (!menus) return command("/help");
+                    const int idx = term::select("Commands", cmds, -1);
+                    return idx < 0 ? true : command(cmds[idx].label);
+                } else if (cmd == "/theme") {
+                    if (arg.empty() && menus) {
+                        if (pick_theme("Theme")) std::printf("%stheme: %s%s\n", term::sgr(term::theme().dim).c_str(), term::theme().name, off.c_str());
+                    } else if (arg.empty()) {
+                        for (auto& t : term::themes()) std::printf("  %-18s %s\n", t.name, t.desc);
+                    } else {
+                        if (!term::set_theme(arg)) throw std::runtime_error("no theme '" + arg + "' (/theme lists them)");
+                        save_theme(arg);
+                    }
+                    apply_theme();
+                } else if (cmd == "/settings" || cmd == "/config") {
+                    if (!menus) {
+                        print_settings();
+                        return true;
+                    }
+                    // Settings menu: Enter changes the highlighted one, Esc leaves.
+                    in_config = true;
+                    struct Leave {
+                        bool& f;
+                        ~Leave() { f = false; }
+                    } leave{in_config};
+                    auto num = [](double v, const char* fmt) {
+                        char b[32];
+                        std::snprintf(b, sizeof b, fmt, v);
+                        return std::string(b);
+                    };
+                    auto ask = [&](const std::string& what, const std::string& set_cmd) {  // a typed value -> a command
+                        std::string v;
+                        if (term::read_message("  " + what + " " + accent_b + "\xE2\x9D\xAF " + off, v) == term::Input::Line &&
+                            v.find_first_not_of(" \t") != std::string::npos)
+                            command(set_cmd + " " + v);
+                    };
+                    for (int at = 0;;) {
+                        const std::string reasoning = !o.think ? "off" : o.hide_think ? "on, hidden" : "on, shown";
+                        const std::vector<term::Choice> rows = {
+                            {"Theme", term::theme().name},
+                            {"Model", short_name(model_name) + " (" + be->name() + ")"},
+                            {"Permission mode", tools_on ? o.permission : "(tools off)"},
+                            {"Reasoning", reasoning},
+                            {"Tools", tools_on ? "on" : "off"},
+                            {"Temperature", o.greedy ? "greedy" : num(o.temperature, "%.2f")},
+                            {"Top-p", num(o.top_p, "%.2f")},
+                            {"Top-k", std::to_string(o.top_k)},
+                            {"Max reply", thousands(o.max_new) + " tokens"},
+                            {"Context size", thousands(be->max_ctx()) + " tokens (changing it reloads the model)"},
+                            {"VRAM reserve", num(o.vram_reserve_gb, "%.1f GB") + " kept free (changing it reloads the model)"},
+                            {"RAM reserve", num(o.ram_reserve_gb, "%.0f GB") + " kept free (changing it reloads the model)"},
+                        };
+                        at = term::select("Settings", rows, at);
+                        if (at < 0) break;
+                        switch (at) {
+                            case 0: command("/theme"); break;
+                            case 1: command("/model"); break;
+                            case 2: command("/permission"); break;
+                            case 3: {
+                                const int r = term::select("Reasoning", {{"on, shown", "the reasoning is printed faintly before the answer"},
+                                                                         {"on, hidden", "a spinner while the model thinks"},
+                                                                         {"off", "no thinking: faster, weaker on hard questions"}},
+                                                           !o.think ? 2 : o.hide_think ? 1 : 0);
+                                if (r >= 0) {
+                                    o.think = r != 2;
+                                    if (r != 2) o.hide_think = r == 1;
+                                }
+                                break;
+                            }
+                            case 4: {
+                                const int r = term::select("Tools (changing this starts a new conversation)",
+                                                           {{"on", "files in the working folder, commands, web"}, {"off", ""}}, tools_on ? 0 : 1);
+                                if (r >= 0 && (r == 0) != tools_on) command(r == 0 ? "/tools on" : "/tools off");
+                                break;
+                            }
+                            case 5: ask("Temperature, 0 to 2 (0 = greedy)", "/set temp"); break;
+                            case 6: ask("Top-p, 0.01 to 1", "/set top-p"); break;
+                            case 7: ask("Top-k, 0 to 1000 (0 = off)", "/set top-k"); break;
+                            case 8: ask("Max tokens per reply", "/set max-tokens"); break;
+                            case 9: ask("Context size in tokens (e.g. 64k)", "/ctx"); break;
+                            case 10: ask("VRAM to keep free, in GB", "/set vram-reserve"); break;
+                            case 11: ask("RAM to keep free, in GB", "/set ram-reserve"); break;
+                        }
+                    }
+                }
+                else if (cmd == "/help" || cmd == "/?") {
+                    std::printf(
+                        "  /                  the command menu\n"
+                        "  /config            all settings in a menu (also /settings)\n"
+                        "  /theme [NAME]      colors: dark, light, dark-colorblind, light-colorblind, ansi, mono\n"
+                        "  /model [NAME]      choose a model, or switch by name (the conversation carries over as a summary)\n"
+                        "  /permission [MODE] how tool actions are approved: ask, edits, all, read-only\n"
+                        "  /ctx [N]           show the context use, or reload with room for N tokens (e.g. /ctx 64k)\n"
+                        "  /settings          all settings;  /set temp|top-p|top-k|greedy|max-tokens VALUE changes one\n"
+                        "  /new               start a new conversation (also /clear, /reset)\n"
+                        "  /think             show / hide the reasoning\n"
+                        "  /reasoning on|off  turn thinking on or off\n"
+                        "  /system [TEXT]     show the system prompt, or set it and start a new conversation\n"
+                        "  /save [NAME]       save this conversation (default name: date and time)\n"
+                        "  /load NAME         resume a saved conversation (/load last = the previous session)\n"
+                        "  /sessions          list saved conversations\n"
+                        "  /info              show the model, its weights folder and the working folder\n"
+                        "  /image FILE        attach an image to the next message (/image lists, /image clear drops)\n"
+                        "  /tools [on|off]    list the tools, or turn them on / off (starts a new conversation)\n"
+                        "  /undo              revert the files changed by the model in its last turn that changed files\n"
+                        "  /compact           summarize the conversation into a fresh context (also automatic when full)\n"
+                        "  /init              have the model study the project and write AGENTS.md (instructions it reads)\n"
+                        "  /exit              quit (also Ctrl+C twice)\n"
+                        "%s  Input: Enter sends; pasted multi-line text is sent as one message; end a line with \\ to\n"
+                        "  continue it, or put \"\"\" on its own line before and after a block. Ctrl+C stops a reply.\n"
+                        "  Image files dropped into the window (or their paths typed in a message) are attached.%s\n",
+                        dim.c_str(), off.c_str());
+                } else if (cmd == "/model" || cmd == "/models") {
+                    const auto models = available_models();
+                    if (arg.empty() && menus) {  // choose from a menu
+                        std::vector<term::Choice> items;
+                        int cur = -1;
+                        for (size_t i = 0; i < models.size(); i++) {
+                            if (models[i].first == model_name) cur = (int)i;
+                            items.push_back({models[i].first, !models[i].second.empty() ? models[i].second
+                                                              : default_backend(models[i].first) == "cpu" ? "cpu backend by default" : "vulkan"});
+                        }
+                        const int idx = term::select("Model (the conversation carries over as a summary)", items, cur);
+                        if (idx < 0 || idx == cur) return true;
+                        arg = models[idx].first;
+                    }
+                    if (arg.empty()) {
+                        std::printf("  %smodels in %s%s\n", dim.c_str(), u8str(model_path.parent_path()).c_str(), off.c_str());
+                        for (auto& [name, why] : models) {
+                            const bool cur = name == model_name;
+                            std::printf("  %s%s%s %-28s %s%s%s\n", cur ? accent_b.c_str() : "", cur ? "\xE2\x97\x8F" : " ",
+                                        off.c_str(), name.c_str(), dim.c_str(),
+                                        cur ? ("current, " + std::string(be->name())).c_str()
+                                            : !why.empty() ? why.c_str()
+                                            : default_backend(name) == "cpu" ? "cpu backend by default" : "",
+                                        off.c_str());
+                        }
+                        std::printf("  %s/model NAME [cpu|vulkan] switches (any unique part of the name works, e.g. 122b); the "
+                                    "conversation is carried over as a summary%s\n", dim.c_str(), off.c_str());
+                    } else {
+                        std::string q = arg, backend;
+                        if (const size_t sp2 = q.find_last_of(" \t"); sp2 != std::string::npos) {
+                            const std::string last = q.substr(sp2 + 1);
+                            if (last == "cpu" || last == "vulkan") {
+                                backend = last;
+                                q = q.substr(0, q.find_last_not_of(" \t", sp2) + 1);
+                            }
+                        }
+                        std::string lq = q;
+                        for (char& ch : lq) ch = (char)std::tolower((unsigned char)ch);
+                        std::vector<std::string> hits;
+                        for (auto& [name, why] : models) {
+                            std::string ln = name;
+                            for (char& ch : ln) ch = (char)std::tolower((unsigned char)ch);
+                            if (ln == lq) { hits = {name}; break; }
+                            if (ln.find(lq) != std::string::npos) hits.push_back(name);
+                        }
+                        if (hits.empty()) throw std::runtime_error("no model matches '" + q + "' (/model lists them)");
+                        if (hits.size() > 1) {
+                            std::string l;
+                            for (auto& h : hits) l += (l.empty() ? "" : ", ") + h;
+                            throw std::runtime_error("'" + q + "' matches several models: " + l);
+                        }
+                        const auto it = std::find_if(models.begin(), models.end(), [&](auto& m) { return m.first == hits[0]; });
+                        if (!it->second.empty()) throw std::runtime_error(hits[0] + " is " + it->second);
+                        if (backend.empty()) backend = default_backend(hits[0]);
+                        if (hits[0] == model_name && backend == be->name()) {
+                            std::printf("%salready using %s%s\n", dim.c_str(), hits[0].c_str(), off.c_str());
+                        } else {
+                            switch_model(u8str(model_path.parent_path() / u8path(hits[0])), backend, o.max_ctx);
+                            set_title();
+                        }
+                    }
+                } else if (cmd == "/ctx" || cmd == "/context") {
+                    if (arg.empty()) {
+                        std::printf("%scontext: %s / %s tokens used; /ctx N reloads the model with room for N tokens%s\n", dim.c_str(),
+                                    thousands(be->pos()).c_str(), thousands(be->max_ctx()).c_str(), off.c_str());
+                    } else {
+                        int n = 0;
+                        try { n = std::stoi(arg); } catch (...) {}
+                        if (arg.back() == 'k' || arg.back() == 'K') n *= 1024;
+                        if (n < 4096 || n > 262144) throw std::runtime_error("/ctx takes 4096 to 262144 tokens (e.g. /ctx 65536 or /ctx 64k)");
+                        if (n != be->max_ctx()) switch_model(o.model_dir, o.backend, n);
+                    }
+                } else if (cmd == "/permission" || cmd == "/permissions") {
+                    static const std::pair<const char*, const char*> modes[] = {
+                        {"ask", "file changes and commands ask first (default)"},
+                        {"edits", "file writes and edits are allowed; deleting and commands still ask"},
+                        {"all", "nothing asks: the model changes files and runs commands on its own"},
+                        {"read-only", "file changes and commands are refused without asking"}};
+                    if (arg.empty() && menus) {
+                        std::vector<term::Choice> items;
+                        int cur = 0;
+                        for (size_t i = 0; i < std::size(modes); i++) {
+                            items.push_back({modes[i].first, modes[i].second});
+                            if (o.permission == modes[i].first) cur = (int)i;
+                        }
+                        const int idx = term::select("Permission mode", items, cur);
+                        if (idx < 0) return true;
+                        arg = modes[idx].first;
+                    }
+                    if (arg.empty()) {
+                        for (auto& [m, d] : modes)
+                            std::printf("  %s%s%s %-10s %s%s%s\n", m == o.permission ? accent_b.c_str() : "",
+                                        m == o.permission ? "\xE2\x97\x8F" : " ", off.c_str(), m, dim.c_str(), d, off.c_str());
+                        if (!always_allow.empty()) {
+                            std::string s;
+                            for (auto& t : always_allow) s += (s.empty() ? "" : ", ") + t;
+                            std::printf("  %salso allowed for this session: %s (/permission reset clears)%s\n", dim.c_str(), s.c_str(), off.c_str());
+                        }
+                    } else if (arg == "reset") {
+                        always_allow.clear();
+                        std::printf("%s'always' approvals cleared%s\n", dim.c_str(), off.c_str());
+                    } else {
+                        if (std::none_of(std::begin(modes), std::end(modes), [&](auto& m) { return arg == m.first; }))
+                            throw std::runtime_error("usage: /permission ask|edits|all|read-only|reset");
+                        o.permission = arg;
+                        std::printf("%spermission: %s%s\n", dim.c_str(), arg.c_str(), off.c_str());
+                    }
+                } else if (cmd == "/set") {
+                    const size_t sp2 = arg.find_first_of(" \t");
+                    const std::string key = arg.substr(0, sp2), val = sp2 == std::string::npos ? "" : arg.substr(arg.find_first_not_of(" \t", sp2));
+                    auto num = [&](double lo, double hi) {
+                        double v;
+                        try { v = std::stod(val); } catch (...) { throw std::runtime_error("/set " + key + " needs a number"); }
+                        if (v < lo || v > hi) throw std::runtime_error("/set " + key + ": out of range");
+                        return v;
+                    };
+                    if (key == "temp" || key == "temperature") { o.temperature = (float)num(0.0, 2.0); o.greedy = false; }
+                    else if (key == "top-p") o.top_p = (float)num(0.01, 1.0);
+                    else if (key == "top-k") o.top_k = (int)num(0, 1000);
+                    else if (key == "greedy") o.greedy = val == "on" || val == "true" || val == "1";
+                    else if (key == "max-tokens") o.max_new = (int)num(16, 1 << 20);
+                    else if (key == "vram-reserve" || key == "ram-reserve") {
+                        (key == "vram-reserve" ? o.vram_reserve_gb : o.ram_reserve_gb) = num(0, key == "vram-reserve" ? 32 : 1024);
+                        switch_model(o.model_dir, o.backend, o.max_ctx);  // the cache and pinning are set up at load
+                    }
+                    else throw std::runtime_error("usage: /set temp|top-p|top-k|greedy|max-tokens|vram-reserve|ram-reserve VALUE");
+                    if (!in_config) print_settings();
+                } else if (cmd == "/undo") {
+                    const std::vector<std::string> done = tools.undo();
+                    if (done.empty()) {
+                        std::printf("%snothing to undo (only file changes made by the model can be undone, not commands)%s\n",
+                                    dim.c_str(), off.c_str());
+                    } else {
+                        std::string list;
+                        for (const std::string& d : done) {
+                            std::printf("  %s\xE2\x86\xB6 %s%s\n", dim.c_str(), d.c_str(), off.c_str());
+                            list += (list.empty() ? "" : "; ") + d;
+                        }
+                        undo_note = "[Note: I reverted the file changes you made in an earlier turn (" + list +
+                                    "). Those files are back to how they were before; I did this on purpose, so do not "
+                                    "redo those changes unless I ask for them again.]";
+                        std::printf("%sthe model will be told with your next message%s%s\n", dim.c_str(),
+                                    tools.undo_depth() ? (" \xC2\xB7 " + std::to_string(tools.undo_depth()) + " more /undo steps").c_str() : "",
+                                    off.c_str());
+                    }
+                } else if (cmd == "/compact") {
+                    if (!compact(false)) std::printf("%snothing to summarize yet%s\n", dim.c_str(), off.c_str());
+                    else autosave();
+                } else if (cmd == "/init") {
+                    if (!tools_on) throw std::runtime_error("/init needs the tools (/tools on)");
+                    do_turn("Study this project so that a coding agent new to it can work on it well: look at its files, layout, "
+                            "build and test setup, and conventions (use list_dir, read_file and search_text; read the README and "
+                            "build files). Then create AGENTS.md in the working folder, or update it if it exists, with concise "
+                            "instructions for AI coding agents: what the project is, how to build, run and test it (exact "
+                            "commands), the code layout, code style and conventions, and important gotchas. Keep it under 80 "
+                            "lines and only include what you verified.",
+                            {});
+                    autosave();
+                } else if (cmd == "/tools") {
+                    if (arg == "on" || arg == "off") {
+                        tools_on = arg == "on";
+                        always_allow.clear();
+                        new_conversation();
+                        std::printf("%stools %s; new conversation%s\n", dim.c_str(), arg.c_str(), off.c_str());
+                    } else {
+                        std::printf("  %stools are %s%s\n", dim.c_str(), tools_on ? "on" : "off (/tools on)", off.c_str());
+                        std::printf("  free:         list_dir, read_file, search_text, web_search, fetch_url\n"
+                                    "  asks first:   write_file, edit_file, delete_path, run_command (PowerShell)\n"
+                                    "  %sfiles: only inside %s; commands start there. Answer 'a' at a prompt to allow\n"
+                                    "  that tool for the rest of the session.%s\n",
+                                    dim.c_str(), u8str(tools.root()).c_str(), off.c_str());
+                        if (!always_allow.empty()) {
+                            std::string s;
+                            for (auto& t : always_allow) s += (s.empty() ? "" : ", ") + t;
+                            std::printf("  %sallowed for this session: %s%s\n", dim.c_str(), s.c_str(), off.c_str());
+                        }
+                    }
+                } else if (cmd == "/image" || cmd == "/img") {
+                    if (arg == "clear") {
+                        pending.clear();
+                        std::printf("%sattachments dropped%s\n", dim.c_str(), off.c_str());
+                    } else if (arg.empty()) {
+                        if (pending.empty()) std::printf("%sno images attached (/image FILE)%s\n", dim.c_str(), off.c_str());
+                        for (const ImageInput& im : pending) std::printf("  %s\n", image_label(im).c_str());
+                    } else {
+                        std::string msg = arg;
+                        const std::vector<std::string> paths = take_image_paths(msg);
+                        if (paths.empty()) throw std::runtime_error("not an image file: " + arg);
+                        for (const std::string& p : paths) attach(p);
+                    }
+                } else if (cmd == "/new" || cmd == "/clear" || cmd == "/reset") {
+                    new_conversation();
+                    std::printf("%snew conversation%s\n", dim.c_str(), off.c_str());
+                } else if (cmd == "/think") {
+                    o.hide_think = !o.hide_think;
+                    std::printf("%sreasoning %s%s\n", dim.c_str(), o.hide_think ? "hidden" : "shown", off.c_str());
+                } else if (cmd == "/reasoning") {
+                    if (arg == "on") o.think = true;
+                    else if (arg == "off") o.think = false;
+                    else throw std::runtime_error("usage: /reasoning on|off");
+                    std::printf("%sthinking %s%s\n", dim.c_str(), o.think ? "on" : "off", off.c_str());
+                } else if (cmd == "/system") {
+                    if (arg.empty()) {
+                        std::printf("%s%s%s\n", dim.c_str(), sess.system.empty() ? "(no system prompt)" : sess.system.c_str(), off.c_str());
+                    } else {
+                        o.system = arg;
+                        new_conversation();
+                        std::printf("%ssystem prompt set; new conversation%s\n", dim.c_str(), off.c_str());
+                    }
+                } else if (cmd == "/save") {
+                    std::string name = arg;
+                    if (name.empty()) {
+                        const std::time_t now = std::time(nullptr);
+                        char b[32];
+                        std::strftime(b, sizeof b, "%Y-%m-%d_%H-%M-%S", std::localtime(&now));
+                        name = b;
+                    }
+                    name = clean_name(name);
+                    const fs::path p = session_dir / (name + ".json");
+                    save_session(p, model_name, sess);
+                    std::printf("%ssaved '%s' (%s)%s\n", dim.c_str(), name.c_str(), p.string().c_str(), off.c_str());
+                } else if (cmd == "/load") {
+                    if (arg.empty() && menus) {
+                        const std::vector<std::string> names = session_names();
+                        std::vector<term::Choice> items;
+                        for (auto& n : names) items.push_back({n, ""});
+                        if (names.empty()) list_sessions();
+                        const int idx = term::select("Resume which conversation?", items, -1);
+                        if (idx >= 0) resume(names[idx]);
+                    } else if (arg.empty()) list_sessions();
+                    else resume(arg);
+                } else if (cmd == "/info") {
+                    info();
+                } else if (cmd == "/sessions" || cmd == "/list") {
+                    list_sessions();
+                } else {
+                    std::printf("%sunknown command %s (/help lists them; start with a space to send text beginning with /)%s\n",
+                                red.c_str(), cmd.c_str(), off.c_str());
+                }
+            } catch (const std::exception& e) {
+                std::printf("%s%s%s\n", red.c_str(), e.what(), off.c_str());
+            }
+            return true;
+        };
         bool exit_armed = false;  // a second Ctrl+C at the prompt quits
+        if (!o.first_msg.empty()) {  // qwen "question": the first message
+            std::printf("\n%s\xE2\x9D\xAF %s%s\n\n", accent_b.c_str(), off.c_str(), o.first_msg.c_str());
+            try {
+                do_turn(o.first_msg, {});
+                autosave();
+            } catch (const std::exception& e) {
+                std::printf("%serror: %s%s\n", red.c_str(), e.what(), off.c_str());
+            }
+        }
         for (;;) {
             std::string line;
             const std::string prompt = "\n" + status_line() + "\n" +
                                        (pending.empty() ? "" : cyan + "[" + std::to_string(pending.size()) +
                                                                    (pending.size() == 1 ? " image] " : " images] ")) +
-                                       term::sgr("1;32") + "> " + off;
+                                       accent_b + "\xE2\x9D\xAF " + off;
             const term::Input r = term::read_message(prompt, line);
             if (r == term::Input::Eof) break;
             if (r == term::Input::Cancel) {
@@ -1222,251 +1869,7 @@ int main(int argc, char** argv) {
             exit_armed = false;
             if (line.find_first_not_of(" \t\n") == std::string::npos) continue;
             if (line[0] == '/') {
-                const size_t sp = line.find_first_of(" \t");
-                const std::string cmd = line.substr(0, sp);
-                const size_t a0 = sp == std::string::npos ? std::string::npos : line.find_first_not_of(" \t", sp);
-                std::string arg = a0 == std::string::npos ? "" : line.substr(a0);
-                while (!arg.empty() && std::isspace((unsigned char)arg.back())) arg.pop_back();
-                try {
-                    if (cmd == "/exit" || cmd == "/quit") break;
-                    else if (cmd == "/help" || cmd == "/?") {
-                        std::printf(
-                            "  /model [NAME]      list the models, or switch (the conversation carries over as a summary)\n"
-                            "  /permission [MODE] how tool actions are approved: ask, edits, all, read-only\n"
-                            "  /ctx [N]           show the context use, or reload with room for N tokens (e.g. /ctx 64k)\n"
-                            "  /settings          all settings;  /set temp|top-p|top-k|greedy|max-tokens VALUE changes one\n"
-                            "  /new               start a new conversation (also /clear, /reset)\n"
-                            "  /think             show / hide the reasoning\n"
-                            "  /reasoning on|off  turn thinking on or off\n"
-                            "  /system [TEXT]     show the system prompt, or set it and start a new conversation\n"
-                            "  /save [NAME]       save this conversation (default name: date and time)\n"
-                            "  /load NAME         resume a saved conversation (/load last = the previous session)\n"
-                            "  /sessions          list saved conversations\n"
-                            "  /info              show the model, its weights folder and the working folder\n"
-                            "  /image FILE        attach an image to the next message (/image lists, /image clear drops)\n"
-                            "  /tools [on|off]    list the tools, or turn them on / off (starts a new conversation)\n"
-                            "  /undo              revert the files changed by the model in its last turn that changed files\n"
-                            "  /compact           summarize the conversation into a fresh context (also automatic when full)\n"
-                            "  /init              have the model study the project and write AGENTS.md (instructions it reads)\n"
-                            "  /exit              quit (also Ctrl+C twice)\n"
-                            "%s  Input: Enter sends; pasted multi-line text is sent as one message; end a line with \\ to\n"
-                            "  continue it, or put \"\"\" on its own line before and after a block. Ctrl+C stops a reply.\n"
-                            "  Image files dropped into the window (or their paths typed in a message) are attached.%s\n",
-                            dim.c_str(), off.c_str());
-                    } else if (cmd == "/model" || cmd == "/models") {
-                        const auto models = available_models();
-                        if (arg.empty()) {
-                            std::printf("  %smodels in %s%s\n", dim.c_str(), u8str(model_path.parent_path()).c_str(), off.c_str());
-                            for (auto& [name, why] : models) {
-                                const bool cur = name == model_name;
-                                std::printf("  %s%s%s %-28s %s%s%s\n", cur ? term::sgr("1;36").c_str() : "", cur ? "\xE2\x97\x8F" : " ",
-                                            off.c_str(), name.c_str(), dim.c_str(),
-                                            cur ? ("current, " + std::string(be->name())).c_str()
-                                                : !why.empty() ? why.c_str()
-                                                : default_backend(name) == "cpu" ? "cpu backend by default" : "",
-                                            off.c_str());
-                            }
-                            std::printf("  %s/model NAME [cpu|vulkan] switches (any unique part of the name works, e.g. 122b); the "
-                                        "conversation is carried over as a summary%s\n", dim.c_str(), off.c_str());
-                        } else {
-                            std::string q = arg, backend;
-                            if (const size_t sp2 = q.find_last_of(" \t"); sp2 != std::string::npos) {
-                                const std::string last = q.substr(sp2 + 1);
-                                if (last == "cpu" || last == "vulkan") {
-                                    backend = last;
-                                    q = q.substr(0, q.find_last_not_of(" \t", sp2) + 1);
-                                }
-                            }
-                            std::string lq = q;
-                            for (char& ch : lq) ch = (char)std::tolower((unsigned char)ch);
-                            std::vector<std::string> hits;
-                            for (auto& [name, why] : models) {
-                                std::string ln = name;
-                                for (char& ch : ln) ch = (char)std::tolower((unsigned char)ch);
-                                if (ln == lq) { hits = {name}; break; }
-                                if (ln.find(lq) != std::string::npos) hits.push_back(name);
-                            }
-                            if (hits.empty()) throw std::runtime_error("no model matches '" + q + "' (/model lists them)");
-                            if (hits.size() > 1) {
-                                std::string l;
-                                for (auto& h : hits) l += (l.empty() ? "" : ", ") + h;
-                                throw std::runtime_error("'" + q + "' matches several models: " + l);
-                            }
-                            const auto it = std::find_if(models.begin(), models.end(), [&](auto& m) { return m.first == hits[0]; });
-                            if (!it->second.empty()) throw std::runtime_error(hits[0] + " is " + it->second);
-                            if (backend.empty()) backend = default_backend(hits[0]);
-                            if (hits[0] == model_name && backend == be->name()) {
-                                std::printf("%salready using %s%s\n", dim.c_str(), hits[0].c_str(), off.c_str());
-                            } else {
-                                switch_model(u8str(model_path.parent_path() / u8path(hits[0])), backend, o.max_ctx);
-                                set_title();
-                            }
-                        }
-                    } else if (cmd == "/ctx" || cmd == "/context") {
-                        if (arg.empty()) {
-                            std::printf("%scontext: %s / %s tokens used; /ctx N reloads the model with room for N tokens%s\n", dim.c_str(),
-                                        thousands(be->pos()).c_str(), thousands(be->max_ctx()).c_str(), off.c_str());
-                        } else {
-                            int n = 0;
-                            try { n = std::stoi(arg); } catch (...) {}
-                            if (arg.back() == 'k' || arg.back() == 'K') n *= 1024;
-                            if (n < 4096 || n > 262144) throw std::runtime_error("/ctx takes 4096 to 262144 tokens (e.g. /ctx 65536 or /ctx 64k)");
-                            if (n != be->max_ctx()) switch_model(o.model_dir, o.backend, n);
-                        }
-                    } else if (cmd == "/permission" || cmd == "/permissions") {
-                        static const std::pair<const char*, const char*> modes[] = {
-                            {"ask", "file changes and commands ask first (default)"},
-                            {"edits", "file writes and edits are allowed; deleting and commands still ask"},
-                            {"all", "nothing asks: the model changes files and runs commands on its own"},
-                            {"read-only", "file changes and commands are refused without asking"}};
-                        if (arg.empty()) {
-                            for (auto& [m, d] : modes)
-                                std::printf("  %s%s%s %-10s %s%s%s\n", m == o.permission ? term::sgr("1;36").c_str() : "",
-                                            m == o.permission ? "\xE2\x97\x8F" : " ", off.c_str(), m, dim.c_str(), d, off.c_str());
-                            if (!always_allow.empty()) {
-                                std::string s;
-                                for (auto& t : always_allow) s += (s.empty() ? "" : ", ") + t;
-                                std::printf("  %salso allowed for this session: %s (/permission reset clears)%s\n", dim.c_str(), s.c_str(), off.c_str());
-                            }
-                        } else if (arg == "reset") {
-                            always_allow.clear();
-                            std::printf("%s'always' approvals cleared%s\n", dim.c_str(), off.c_str());
-                        } else {
-                            if (std::none_of(std::begin(modes), std::end(modes), [&](auto& m) { return arg == m.first; }))
-                                throw std::runtime_error("usage: /permission ask|edits|all|read-only|reset");
-                            o.permission = arg;
-                            std::printf("%spermission: %s%s\n", dim.c_str(), arg.c_str(), off.c_str());
-                        }
-                    } else if (cmd == "/settings" || cmd == "/config") {
-                        print_settings();
-                    } else if (cmd == "/set") {
-                        const size_t sp2 = arg.find_first_of(" \t");
-                        const std::string key = arg.substr(0, sp2), val = sp2 == std::string::npos ? "" : arg.substr(arg.find_first_not_of(" \t", sp2));
-                        auto num = [&](double lo, double hi) {
-                            double v;
-                            try { v = std::stod(val); } catch (...) { throw std::runtime_error("/set " + key + " needs a number"); }
-                            if (v < lo || v > hi) throw std::runtime_error("/set " + key + ": out of range");
-                            return v;
-                        };
-                        if (key == "temp" || key == "temperature") { o.temperature = (float)num(0.0, 2.0); o.greedy = false; }
-                        else if (key == "top-p") o.top_p = (float)num(0.01, 1.0);
-                        else if (key == "top-k") o.top_k = (int)num(0, 1000);
-                        else if (key == "greedy") o.greedy = val == "on" || val == "true" || val == "1";
-                        else if (key == "max-tokens") o.max_new = (int)num(16, 1 << 20);
-                        else if (key == "vram-reserve" || key == "ram-reserve") {
-                            (key == "vram-reserve" ? o.vram_reserve_gb : o.ram_reserve_gb) = num(0, key == "vram-reserve" ? 32 : 1024);
-                            switch_model(o.model_dir, o.backend, o.max_ctx);  // the cache and pinning are set up at load
-                        }
-                        else throw std::runtime_error("usage: /set temp|top-p|top-k|greedy|max-tokens|vram-reserve|ram-reserve VALUE");
-                        print_settings();
-                    } else if (cmd == "/undo") {
-                        const std::vector<std::string> done = tools.undo();
-                        if (done.empty()) {
-                            std::printf("%snothing to undo (only file changes made by the model can be undone, not commands)%s\n",
-                                        dim.c_str(), off.c_str());
-                        } else {
-                            std::string list;
-                            for (const std::string& d : done) {
-                                std::printf("  %s\xE2\x86\xB6 %s%s\n", dim.c_str(), d.c_str(), off.c_str());
-                                list += (list.empty() ? "" : "; ") + d;
-                            }
-                            undo_note = "[Note: I reverted the file changes you made in an earlier turn (" + list +
-                                        "). Those files are back to how they were before; I did this on purpose, so do not "
-                                        "redo those changes unless I ask for them again.]";
-                            std::printf("%sthe model will be told with your next message%s%s\n", dim.c_str(),
-                                        tools.undo_depth() ? (" \xC2\xB7 " + std::to_string(tools.undo_depth()) + " more /undo steps").c_str() : "",
-                                        off.c_str());
-                        }
-                    } else if (cmd == "/compact") {
-                        if (!compact(false)) std::printf("%snothing to summarize yet%s\n", dim.c_str(), off.c_str());
-                        else autosave();
-                    } else if (cmd == "/init") {
-                        if (!tools_on) throw std::runtime_error("/init needs the tools (/tools on)");
-                        do_turn("Study this project so that a coding agent new to it can work on it well: look at its files, layout, "
-                                "build and test setup, and conventions (use list_dir, read_file and search_text; read the README and "
-                                "build files). Then create AGENTS.md in the working folder, or update it if it exists, with concise "
-                                "instructions for AI coding agents: what the project is, how to build, run and test it (exact "
-                                "commands), the code layout, code style and conventions, and important gotchas. Keep it under 80 "
-                                "lines and only include what you verified.",
-                                {});
-                        autosave();
-                    } else if (cmd == "/tools") {
-                        if (arg == "on" || arg == "off") {
-                            tools_on = arg == "on";
-                            always_allow.clear();
-                            new_conversation();
-                            std::printf("%stools %s; new conversation%s\n", dim.c_str(), arg.c_str(), off.c_str());
-                        } else {
-                            std::printf("  %stools are %s%s\n", dim.c_str(), tools_on ? "on" : "off (/tools on)", off.c_str());
-                            std::printf("  free:         list_dir, read_file, search_text, web_search, fetch_url\n"
-                                        "  asks first:   write_file, edit_file, delete_path, run_command (PowerShell)\n"
-                                        "  %sfiles: only inside %s; commands start there. Answer 'a' at a prompt to allow\n"
-                                        "  that tool for the rest of the session.%s\n",
-                                        dim.c_str(), u8str(tools.root()).c_str(), off.c_str());
-                            if (!always_allow.empty()) {
-                                std::string s;
-                                for (auto& t : always_allow) s += (s.empty() ? "" : ", ") + t;
-                                std::printf("  %sallowed for this session: %s%s\n", dim.c_str(), s.c_str(), off.c_str());
-                            }
-                        }
-                    } else if (cmd == "/image" || cmd == "/img") {
-                        if (arg == "clear") {
-                            pending.clear();
-                            std::printf("%sattachments dropped%s\n", dim.c_str(), off.c_str());
-                        } else if (arg.empty()) {
-                            if (pending.empty()) std::printf("%sno images attached (/image FILE)%s\n", dim.c_str(), off.c_str());
-                            for (const ImageInput& im : pending) std::printf("  %s\n", image_label(im).c_str());
-                        } else {
-                            std::string msg = arg;
-                            const std::vector<std::string> paths = take_image_paths(msg);
-                            if (paths.empty()) throw std::runtime_error("not an image file: " + arg);
-                            for (const std::string& p : paths) attach(p);
-                        }
-                    } else if (cmd == "/new" || cmd == "/clear" || cmd == "/reset") {
-                        new_conversation();
-                        std::printf("%snew conversation%s\n", dim.c_str(), off.c_str());
-                    } else if (cmd == "/think") {
-                        o.hide_think = !o.hide_think;
-                        std::printf("%sreasoning %s%s\n", dim.c_str(), o.hide_think ? "hidden" : "shown", off.c_str());
-                    } else if (cmd == "/reasoning") {
-                        if (arg == "on") o.think = true;
-                        else if (arg == "off") o.think = false;
-                        else throw std::runtime_error("usage: /reasoning on|off");
-                        std::printf("%sthinking %s%s\n", dim.c_str(), o.think ? "on" : "off", off.c_str());
-                    } else if (cmd == "/system") {
-                        if (arg.empty()) {
-                            std::printf("%s%s%s\n", dim.c_str(), sess.system.empty() ? "(no system prompt)" : sess.system.c_str(), off.c_str());
-                        } else {
-                            o.system = arg;
-                            new_conversation();
-                            std::printf("%ssystem prompt set; new conversation%s\n", dim.c_str(), off.c_str());
-                        }
-                    } else if (cmd == "/save") {
-                        std::string name = arg;
-                        if (name.empty()) {
-                            const std::time_t now = std::time(nullptr);
-                            char b[32];
-                            std::strftime(b, sizeof b, "%Y-%m-%d_%H-%M-%S", std::localtime(&now));
-                            name = b;
-                        }
-                        name = clean_name(name);
-                        const fs::path p = session_dir / (name + ".json");
-                        save_session(p, model_name, sess);
-                        std::printf("%ssaved '%s' (%s)%s\n", dim.c_str(), name.c_str(), p.string().c_str(), off.c_str());
-                    } else if (cmd == "/load") {
-                        if (arg.empty()) list_sessions();
-                        else resume(arg);
-                    } else if (cmd == "/info") {
-                        info();
-                    } else if (cmd == "/sessions" || cmd == "/list") {
-                        list_sessions();
-                    } else {
-                        std::printf("%sunknown command %s (/help lists them; start with a space to send text beginning with /)%s\n",
-                                    red.c_str(), cmd.c_str(), off.c_str());
-                    }
-                } catch (const std::exception& e) {
-                    std::printf("%s%s%s\n", red.c_str(), e.what(), off.c_str());
-                }
+                if (!command(line)) break;
                 continue;
             }
             try {

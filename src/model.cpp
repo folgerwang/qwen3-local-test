@@ -68,6 +68,15 @@ Config Config::load(const std::string& dir) {
         if (t["indexer_kv_heads"].as_int() != 1) throw std::runtime_error("unsupported indexer_kv_heads");
     }
 
+    // 4-bit GPTQ checkpoints: only the layout the shaders implement (symmetric, group 128, no act-order)
+    if (const json::Value* q = root.find("quantization_config"); q && q->find("quant_method") && (*q)["quant_method"].as_str() == "gptq") {
+        const json::Value* sym = q->find("sym");
+        const json::Value* act = q->find("desc_act");
+        if (q->get_int("bits", 0) != 4 || q->get_int("group_size", 0) != 128 || !sym || !sym->b || (act && act->b))
+            throw std::runtime_error("unsupported GPTQ layout (supported: 4 bits, group 128, symmetric, no act-order)");
+        c.expert_q4 = true;
+    }
+
     // vision tower (not wired up for qwen4_exp yet)
     if (const json::Value* v = root.find("vision_config"); v && !c.qwen4) {
         Config::Vision& vc = c.vis;
@@ -156,6 +165,27 @@ static QMat qmat(const SafeTensors& st, const std::string& name, int rows, int c
     check_shape(t, name, {rows, cols});
     check_shape(s, name + ".weight_scale_inv", {rows / 128, cols / 128});
     return QMat{t.data, (const uint16_t*)s.data, rows, cols};
+}
+
+// 4-bit GPTQ projection [rows, cols]. `check_zeros`: verify the stored zero points are the symmetric 8 (GPTQ v1
+// stores 7, meaning 8; v2 stores 8), which the shaders assume.
+static Q4Mat q4mat(const SafeTensors& st, const std::string& name, int rows, int cols, bool check_zeros) {
+    const TensorView& w = st.get(name + ".qweight");
+    const TensorView& s = st.get(name + ".scales");
+    if (w.dtype != DType::I32 || s.dtype != DType::F16) throw std::runtime_error("unexpected GPTQ tensor types: " + name);
+    if (cols % 128) throw std::runtime_error("GPTQ input size not a multiple of 128: " + name);
+    check_shape(w, name + ".qweight", {cols / 8, rows});
+    check_shape(s, name + ".scales", {cols / 128, rows});
+    if (check_zeros) {
+        const TensorView& z = st.get(name + ".qzeros");
+        const uint32_t* zp = (const uint32_t*)z.data;
+        const uint32_t first = zp[0] & 15u;
+        if (first != 7u && first != 8u) throw std::runtime_error("GPTQ zero points are not symmetric: " + name);
+        for (int64_t i = 0; i < z.numel(); i++)
+            for (int j = 0; j < 8; j++)
+                if (((zp[i] >> (4 * j)) & 15u) != first) throw std::runtime_error("GPTQ zero points vary (asymmetric): " + name);
+    }
+    return Q4Mat{(const uint32_t*)w.data, (const uint16_t*)s.data, rows, cols};
 }
 
 // FP8 block-scaled or BF16 projection, whichever the checkpoint has.
@@ -276,8 +306,15 @@ void ModelWeights::load(const SafeTensors& st, const Config& c) {
         L.experts.resize(c.n_experts);
         for (int e = 0; e < c.n_experts; e++) {
             const std::string ep = m + "experts." + std::to_string(e) + ".";
-            L.experts[e] = {qmat(st, ep + "gate_proj", c.moe_inter, H), qmat(st, ep + "up_proj", c.moe_inter, H),
-                            qmat(st, ep + "down_proj", H, c.moe_inter)};
+            if (c.expert_q4) {
+                const bool chk = e == 0;  // one expert per layer: reading all zero points would take a while
+                L.experts[e].g4 = q4mat(st, ep + "gate_proj", c.moe_inter, H, chk);
+                L.experts[e].u4 = q4mat(st, ep + "up_proj", c.moe_inter, H, chk);
+                L.experts[e].d4 = q4mat(st, ep + "down_proj", H, c.moe_inter, chk);
+            } else {
+                L.experts[e] = {qmat(st, ep + "gate_proj", c.moe_inter, H), qmat(st, ep + "up_proj", c.moe_inter, H),
+                                qmat(st, ep + "down_proj", H, c.moe_inter), {}, {}, {}};
+            }
         }
     }
 

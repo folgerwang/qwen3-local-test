@@ -43,7 +43,7 @@ struct VulkanOptions {
     int hybrid = -1;             // CPU computes cache misses: -1 auto (only if pinning fails), 0 off, 1 on
     bool vision = true;          // load the vision tower (when the model has one)
     int64_t image_max_pixels = 1 << 20;  // largest image the vision buffers are sized for
-    size_t vram_reserve_mb = 3072;       // VRAM left free for other programs (auto expert cache size)
+    size_t vram_reserve_mb = 5120;       // VRAM left free for other programs (auto expert cache size)
     size_t ram_reserve_mb = 16384;       // system RAM left free: experts are not pinned if that would cut into it
 };
 std::unique_ptr<Backend> make_vulkan_backend(const Config& cfg, const ModelWeights& w, int max_ctx, const VulkanOptions& opt);

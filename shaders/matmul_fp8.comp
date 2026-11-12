@@ -47,6 +47,45 @@ void main() {
     float acc1[NT], acc2[NT];
     for (uint t = 0; t < NT; t++) { acc1[t] = 0.0; acc2[t] = 0.0; }
 
+#ifdef Q4
+    // 4-bit: each lane step covers 32 inputs (one uvec4) inside one 128-input scale group of this row
+    const uint qchunks = cols / 32u, qbase = row * qchunks, qsbase = row * nblk;
+    for (uint c = lane; c < qchunks; c += 32u) {
+        vec4 a[8];
+        {
+            const uvec4 wv = U4(w1).v[qbase + c];
+            q4x8(wv.x, a[0], a[1]); q4x8(wv.y, a[2], a[3]); q4x8(wv.z, a[4], a[5]); q4x8(wv.w, a[6], a[7]);
+        }
+        const float sc = f16_at(s1, qsbase + c / 4u);
+#ifdef SWIGLU
+        vec4 b[8];
+        {
+            const uvec4 wv2 = U4(w2).v[qbase + c];
+            q4x8(wv2.x, b[0], b[1]); q4x8(wv2.y, b[2], b[3]); q4x8(wv2.z, b[4], b[5]); q4x8(wv2.w, b[6], b[7]);
+        }
+        const float sc2 = f16_at(s2, qsbase + c / 4u);
+#endif
+        [[unroll]] for (uint t = 0; t < NT; t++) {
+            if (t >= nt) break;
+            F4 xs = F4(pc.x + uint64_t(xrow[t]) * pc.x_stride * 4u);
+            float s1v = 0.0;
+#ifdef SWIGLU
+            float s2v = 0.0;
+#endif
+            [[unroll]] for (uint j = 0; j < 8u; j++) {
+                const vec4 xv = xs.v[c * 8u + j];
+                s1v += dot(a[j], xv);
+#ifdef SWIGLU
+                s2v += dot(b[j], xv);
+#endif
+            }
+            acc1[t] += s1v * sc;
+#ifdef SWIGLU
+            acc2[t] += s2v * sc2;
+#endif
+        }
+    }
+#else
     const uint wbase = row * chunks, sbase = (row / 128u) * nblk;
     for (uint c = lane; c < chunks; c += 32u) {
         const uvec4 wv = U4(w1).v[wbase + c];
@@ -67,6 +106,7 @@ void main() {
 #endif
         }
     }
+#endif
     [[unroll]] for (uint t = 0; t < NT; t++) {
         if (t >= nt) break;
         float r = subgroupAdd(acc1[t]);

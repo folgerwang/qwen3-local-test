@@ -3,8 +3,10 @@
 // terminal (or NO_COLOR is set), so piped output stays exactly what the model produced.
 #pragma once
 #include <chrono>
+#include <functional>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace term {
 
@@ -19,6 +21,31 @@ void clear_interrupt();
 
 // ANSI SGR escape for `code` ("1", "2;3", "36", ...), or "" when colors are off.
 std::string sgr(const char* code);
+
+// Color themes: SGR codes per role ("" = no styling for that role). /theme switches, --theme sets one.
+struct Theme {
+    const char* name;
+    const char* desc;
+    const char *accent, *dim, *ok, *warn, *err, *heading, *code, *fence;
+};
+const std::vector<Theme>& themes();
+const Theme& theme();
+bool set_theme(const std::string& name);  // false if there is no such theme
+
+// Terminal geometry and text measuring (display columns; escape sequences count as 0, CJK and emoji as 2).
+int columns();
+int width(const std::string& utf8);
+std::string fit(const std::string& plain, int cols);  // cut to `cols` columns with an ellipsis (no escapes inside)
+
+// True when menus can be shown: output and input are both a terminal.
+bool interactive();
+
+// Arrow-key menu (up/down or j/k, Enter, a digit to pick directly, Esc to cancel). Returns the chosen index
+// or -1; the menu is erased afterwards. `current` gets a check mark. `on_move` runs when the highlighted row
+// changes (live preview); `footer` returns extra lines (each ending in a newline) shown under the list.
+struct Choice { std::string label, desc; };
+int select(const std::string& title, const std::vector<Choice>& items, int current,
+           const std::function<void(int)>& on_move = {}, const std::function<std::string(int)>& footer = {});
 
 enum class Input { Line, Cancel, Eof };
 // Prints `prompt` and reads one message. Pasted multi-line text arrives as one message, a line ending in
@@ -42,8 +69,11 @@ public:
     explicit Markdown(bool enabled, bool dim = false) : on_(enabled), dim_(dim) {}
     void put(const std::string& text);
     void finish();  // flush held-back characters and reset the styles
+    // Text put in front of the first line (a bullet, with its own styling) and of every later line (indentation).
+    void prefix(std::string first, std::string rest) { pfx_first_ = std::move(first); pfx_rest_ = std::move(rest); }
 
 private:
+    std::string indent(const std::string& o);
     void ch(char c, std::string& o);
     void inline_ch(char c, std::string& o);
     void line_start(std::string& o);
@@ -53,6 +83,8 @@ private:
     bool started_ = false, bol_ = true, fence_ = false, fence_line_ = false;
     bool code_ = false, bold_ = false, star_ = false, heading_ = false;
     std::string hold_;  // start of the current line, held until its kind (fence, heading, bullet) is known
+    std::string pfx_first_, pfx_rest_, last_esc_, cur_esc_;
+    bool need_pfx_ = true, first_line_ = true, in_esc_ = false;
     Utf8Out out_;
 };
 

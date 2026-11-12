@@ -7,6 +7,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 MODELS = {
     "35b": "Qwen/Qwen3.6-35B-A3B-FP8",     # default model (chat.bat), ~35 GB
     "122b": "Qwen/Qwen3.5-122B-A10B-FP8",  # chat-122b.bat, ~119 GB
+    "122b-int4": "Qwen/Qwen3.5-122B-A10B-GPTQ-Int4",  # 4-bit experts, ~73 GB: half the RAM, faster
     "flash": "Qwen/Qwen3.8-Flash-Next-FP8",  # 180B MoE, ~186 GB (engine support in progress)
     "27b": "Qwen/Qwen3.8-27B-FP8",         # dense, ~31 GB (not supported by the engine yet)
 }

@@ -6,7 +6,7 @@
 #include <unordered_map>
 #include <vector>
 
-enum class DType { F32, BF16, F16, F8_E4M3, I64, Unknown };
+enum class DType { F32, BF16, F16, F8_E4M3, I64, I32, Unknown };
 
 size_t dtype_size(DType t);
 

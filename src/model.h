@@ -32,6 +32,7 @@ struct Config {
     int shared_inter = 0;      // 512
     std::vector<bool> is_full_attn;  // per layer
     std::vector<int> eos_ids;
+    bool expert_q4 = false;    // routed experts are 4-bit GPTQ (the other weights BF16)
     // qwen4_exp (Qwen3.8-Flash-Next): hc parallel residual streams mixed around every block, BF16 dense
     // weights, sigmoid DeltaNet output gate, hashed n-gram embedding (PLE) at one layer, sparse attention indexer
     bool qwen4 = false;
@@ -99,8 +100,19 @@ struct Lin {
     int cols() const { return fp8() ? q.cols : b.cols; }
 };
 
+// 4-bit GPTQ weight [rows, cols] (symmetric, group 128, no act-order), as stored: qweight int32 [cols/8, rows]
+// (8 consecutive inputs per word, low nibble first), fp16 scales [cols/128, rows]; value = (q - 8) * scale.
+struct Q4Mat {
+    const uint32_t* qweight = nullptr;
+    const uint16_t* scales = nullptr;
+    int rows = 0, cols = 0;
+    size_t weight_bytes() const { return (size_t)rows * cols / 2; }
+    size_t scale_count() const { return (size_t)rows * (cols / 128); }
+};
+
 struct Expert {
-    QMat gate, up, down;
+    QMat gate, up, down;  // FP8 checkpoints
+    Q4Mat g4, u4, d4;     // 4-bit GPTQ checkpoints (cfg.expert_q4)
 };
 
 // Gated residual over hc streams: norm (grouped per stream), low-rank input mix, per-stream output injection.

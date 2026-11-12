@@ -24,7 +24,7 @@ if(MSVC)
     target_compile_options(qwen PRIVATE /O2 /utf-8 /W3 /bigobj /fp:fast)
     # the image decoder's and web client's DLLs load on first use only (loaded at startup, they cost the
     # CRT its final stdout flush)
-    target_link_options(qwen PRIVATE /DELAYLOAD:WindowsCodecs.dll /DELAYLOAD:ole32.dll /DELAYLOAD:winhttp.dll)
+    target_link_options(qwen PRIVATE /DELAYLOAD:WindowsCodecs.dll /DELAYLOAD:ole32.dll /DELAYLOAD:winhttp.dll /DELAYLOAD:pdh.dll)
     target_link_libraries(qwen PRIVATE delayimp.lib)
     if(QW_NATIVE)
         target_compile_options(qwen PRIVATE /arch:AVX512)
@@ -76,6 +76,12 @@ if(QW_VULKAN)
         "idx_pool|idx_pool.comp|"
         "idx_score|idx_score.comp|"
         "idx_select|idx_select.comp|"
+        "matmul_q4_expert|matmul_fp8.comp|-DEXPERT -DQ4"
+        "matmul_q4_expert_swiglu|matmul_fp8.comp|-DEXPERT -DSWIGLU -DQ4"
+        "gemm_q4_expert|gemm_fp8.comp|-DEXPERT -DQ4"
+        "gemm_q4_expert_swiglu|gemm_fp8.comp|-DEXPERT -DSWIGLU -DQ4"
+        "gemm_coop_q4_expert|gemm_coop.comp|-DEXPERT -DQ4"
+        "gemm_coop_q4_expert_swiglu|gemm_coop.comp|-DEXPERT -DSWIGLU -DQ4"
         "gemm_bf16|gemm_bf16.comp|"
         "layer_norm|layer_norm.comp|"
         "vit_rope|vit_rope.comp|"

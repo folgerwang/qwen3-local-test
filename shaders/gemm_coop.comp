@@ -60,6 +60,21 @@ void store_fp8x8(uvec2 w, uint base, bool second) {
     }
 }
 
+// Q4: 8 4-bit weights of one word, scaled (per row and 128-input group) -> 8 fp16 values at dst[0..7]
+void store_q4x8(uint w, float sc, uint base, bool second) {
+    vec4 lo, hi;
+    q4x8(w, lo, hi);
+    lo *= sc;
+    hi *= sc;
+    [[unroll]] for (uint j = 0; j < 4u; j++) {
+#ifdef SWIGLU
+        if (second) { Ws2[base + j] = float16_t(lo[j]); Ws2[base + 4u + j] = float16_t(hi[j]); continue; }
+#endif
+        Ws[base + j] = float16_t(lo[j]);
+        Ws[base + 4u + j] = float16_t(hi[j]);
+    }
+}
+
 void main() {
     const uint tid = gl_LocalInvocationID.x, sg = gl_SubgroupID;
     const uint r0 = gl_WorkGroupID.x * BM;
@@ -98,9 +113,17 @@ void main() {
 
     for (uint k0 = 0; k0 < cols; k0 += BK) {
         const uint widx = (wrow * cols + k0 + lk) / 8u;
+#ifdef Q4
+        const uint si4 = wrow * nblk + (k0 + lk) / 128u;
+        store_q4x8(U32(w1).v[widx], f16_at(s1, si4), lr * LDA + lk, false);
+#ifdef SWIGLU
+        store_q4x8(U32(w2).v[widx], f16_at(s2, si4), lr * LDA + lk, true);
+#endif
+#else
         store_fp8x8(U2(w1).v[widx], lr * LDA + lk, false);
 #ifdef SWIGLU
         store_fp8x8(U2(w2).v[widx], lr * LDA + lk, true);
+#endif
 #endif
         vec4 x0 = vec4(0.0), x1 = vec4(0.0);
         if (tok_ok) { x0 = xs.v[(k0 + lk) / 4u]; x1 = xs.v[(k0 + lk) / 4u + 1u]; }
@@ -135,6 +158,17 @@ void main() {
             }
         }
         barrier();
+#ifdef Q4
+        // weights were scaled while loading: no per-block scaling
+        [[unroll]] for (uint j = 0; j < 2u; j++) {
+            acc[j] += part[j];
+            part[j] = MatC(0.0);
+#ifdef SWIGLU
+            acc2[j] += part2[j];
+            part2[j] = MatC(0.0);
+#endif
+        }
+#else
         if ((k0 + BK) % 128u == 0u) {  // end of a scale block: acc += scale * part
             const uint si = (r0 / 128u) * nblk + k0 / 128u;
             const float sc = bf16_at(s1, si) * 256.0;
@@ -150,6 +184,7 @@ void main() {
 #endif
             }
         }
+#endif
     }
     [[unroll]] for (uint j = 0; j < 2u; j++) {
 #ifdef SWIGLU
