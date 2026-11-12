@@ -2,6 +2,7 @@
 // 16 columns x 8 key-groups, each thread keeps 16 state entries S[k][v] in registers.
 //   S *= exp(g); kv = S^T k; d = (v - kv) * beta; S += k d^T; o = S^T q
 // V_TILED: value head h pairs with key head h % n_k (GGUF layout) instead of h / ratio.
+// SNAP: also stores the state after every token but the last at snap + t * snap_stride.
 #version 460
 #include "common.glsl"
 
@@ -15,6 +16,10 @@ layout(local_size_x = 128) in;
 layout(push_constant) uniform PC {
     uint64_t qkv, a, b, neg_a, dt_bias, state, out_;
     uint n, conv_dim, key_dim, n_v_heads, ratio;
+#ifdef SNAP
+    uint64_t snap;
+    uint snap_stride;
+#endif
 } pc;
 
 shared float qs[KD], ks[KD], part[KG][VS], dsh[VS], red[8];
@@ -69,6 +74,12 @@ void main() {
             F32(pc.out_ + uint64_t(t) * pc.n_v_heads * DV * 4u).v[h * DV + vcol] = o;
         }
         barrier();
+#ifdef SNAP
+        if (t + 1u < pc.n) {
+            F32 sn = F32(pc.snap + uint64_t(t) * pc.snap_stride + uint64_t(h) * KD * DV * 4u);
+            [[unroll]] for (uint i = 0; i < KPER; i++) sn.v[(kg * KPER + i) * DV + vcol] = S[i];
+        }
+#endif
     }
     [[unroll]] for (uint i = 0; i < KPER; i++) st.v[(kg * KPER + i) * DV + vcol] = S[i];
 }

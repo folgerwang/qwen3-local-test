@@ -1,5 +1,7 @@
 // Causal depthwise conv1d (kernel K) + SiLU over n tokens, in place. One thread per channel.
 // state holds the previous K-1 inputs per channel, oldest first: state[k * channels + ch].
+// SNAP: also stores the state after every token but the last at snap + t * snap_stride (speculative decoding
+// rolls back to one of them).
 #version 460
 #include "common.glsl"
 
@@ -8,6 +10,10 @@ layout(local_size_x = 256) in;
 layout(push_constant) uniform PC {
     uint64_t data, w, state;
     uint n, channels;
+#ifdef SNAP
+    uint64_t snap;
+    uint snap_stride;
+#endif
 } pc;
 
 void main() {
@@ -25,6 +31,12 @@ void main() {
         [[unroll]] for (uint k = 0; k < K - 2; k++) hist[k] = hist[k + 1];
         hist[K - 2] = in_;
         d.v[idx] = silu(acc);
+#ifdef SNAP
+        if (t + 1u < pc.n) {
+            F32 sn = F32(pc.snap + uint64_t(t) * pc.snap_stride);
+            [[unroll]] for (uint k = 0; k < K - 1; k++) sn.v[k * pc.channels + ch] = hist[k];
+        }
+#endif
     }
     [[unroll]] for (uint k = 0; k < K - 1; k++) st.v[k * pc.channels + ch] = hist[k];
 }

@@ -79,8 +79,15 @@ struct Q4Weights {
     gq::GMat embed, output;
     gq::GMat ple_table;  // [rows, ple_dim]
     Q4Hc hc_head;
-    std::vector<Q4Layer> layers;
+    std::vector<Q4Layer> layers;  // the trunk; with an MTP draft head its block is layers[n_layers]
+    // MTP draft head (optional): one more full-attention block that predicts the token after next from the
+    // trunk's residual streams at a position and the embedding of the next token.
+    bool has_mtp = false;
+    gq::GMat mtp_eh;                          // [hidden, 2 * hidden]: (normed embedding | normed stream) -> stream
+    std::vector<float> mtp_enorm, mtp_hnorm;  // [hidden], [hc * hidden]
+    Q4Hc mtp_head;                            // output mixer of the draft block (no injection)
     void load(const Gguf& g, const Q4Config& cfg);
+    void load_mtp(const Gguf& g, const Q4Config& cfg);
 };
 
 // PLE embedding of position p: the rows of the n-gram table picked by hashing toks[p] with its predecessors

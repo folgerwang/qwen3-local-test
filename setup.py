@@ -7,7 +7,8 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 # key -> (repo, file patterns or None for the whole repo)
 MODELS = {
     # default model (chat.bat): Qwen3.8-Flash-Next 128B as Unsloth's 4-bit UD-Q4_K_XL GGUF, ~111 GB
-    "flash": ("unsloth/Qwen3.8-Flash-Next-GGUF", ["UD-Q4_K_XL/*"]),
+    # plus its MTP draft head (4 GB) for speculative decoding
+    "flash": ("unsloth/Qwen3.8-Flash-Next-GGUF", ["UD-Q4_K_XL/*", "mtp-*.gguf"]),
     "35b": ("Qwen/Qwen3.6-35B-A3B-FP8", None),     # chat-35b.bat, ~35 GB
     "122b": ("Qwen/Qwen3.5-122B-A10B-FP8", None),  # chat-122b.bat, ~119 GB
     "27b": ("Qwen/Qwen3.8-27B-FP8", None),         # ~12 GB

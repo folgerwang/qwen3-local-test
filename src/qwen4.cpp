@@ -84,30 +84,27 @@ Q4Config Q4Config::load(const Gguf& g) {
     return c;
 }
 
-void Q4Weights::load(const Gguf& g, const Q4Config& c) {
-    const int H = c.hidden, HC = c.hc_dim();
-    auto mat = [&](const std::string& n, int rows, int cols, int count = 1) { return gq::make_mat(g.get(n), n, rows, cols, count); };
-    auto vec = [&](const std::string& n, size_t len) { return gq::to_floats(g.get(n), n, len); };
-    auto hc = [&](const std::string& pre, bool inject) {
+namespace {
+
+struct Loader {
+    const Gguf& g;
+    const Q4Config& c;
+    gq::GMat mat(const std::string& n, int rows, int cols, int count = 1) const { return gq::make_mat(g.get(n), n, rows, cols, count); }
+    std::vector<float> vec(const std::string& n, size_t len) const { return gq::to_floats(g.get(n), n, len); }
+    Q4Hc hc(const std::string& pre, bool inject) const {
         Q4Hc h;
-        h.norm = vec(pre + "norm.weight", HC);
-        h.down = mat(pre + "down.weight", c.hc_rank, HC);
-        h.up = mat(pre + "up.weight", HC, c.hc_rank);
-        if (inject) h.inject = mat(pre + "inject.weight", c.hc, HC);
+        h.norm = vec(pre + "norm.weight", c.hc_dim());
+        h.down = mat(pre + "down.weight", c.hc_rank, c.hc_dim());
+        h.up = mat(pre + "up.weight", c.hc_dim(), c.hc_rank);
+        if (inject) h.inject = mat(pre + "inject.weight", c.hc, c.hc_dim());
         return h;
-    };
-
-    embed = mat("token_embd.weight", c.vocab, H);
-    output = g.find("output.weight") ? mat("output.weight", c.vocab, H) : embed;
-    hc_head = hc("output_hc_", false);
-
-    bool any_ple = false;
-    layers.resize(c.n_layers);
-    for (int l = 0; l < c.n_layers; l++) {
-        Q4Layer& L = layers[l];
+    }
+    Q4Layer layer(int l, bool full_attn, int compress, bool ple) const {
+        const int H = c.hidden, HC = c.hc_dim();
+        Q4Layer L;
         const std::string b = "blk." + std::to_string(l) + ".";
-        L.full_attn = c.is_full_attn[l];
-        L.compress = c.compress[l];
+        L.full_attn = full_attn;
+        L.compress = compress;
         L.hc_attn = hc(b + "hc_attn_", true);
         L.hc_ffn = hc(b + "hc_ffn_", true);
         if (L.full_attn) {
@@ -136,8 +133,8 @@ void Q4Weights::load(const Gguf& g, const Q4Config& c) {
             L.ssm_a = vec(b + "ssm_a", NV);
             L.ssm_norm = vec(b + "ssm_norm.weight", c.lin_v_dim);
         }
-        if (c.is_ple[l]) {
-            L.ple = any_ple = true;
+        if (ple) {
+            L.ple = true;
             L.ple_key = mat(b + "ple_key.weight", HC, H);
             L.ple_value = mat(b + "ple_value.weight", H, H);
             L.ple_norm_key = vec(b + "ple_norm_key.weight", HC);
@@ -153,6 +150,23 @@ void Q4Weights::load(const Gguf& g, const Q4Config& c) {
         L.ex_gate = mat(b + "ffn_gate_exps.weight", c.moe_inter, H, c.n_experts);
         L.ex_up = mat(b + "ffn_up_exps.weight", c.moe_inter, H, c.n_experts);
         L.ex_down = mat(b + "ffn_down_exps.weight", H, c.moe_inter, c.n_experts);
+        return L;
+    }
+};
+
+}  // namespace
+
+void Q4Weights::load(const Gguf& g, const Q4Config& c) {
+    const Loader ld{g, c};
+    const int H = c.hidden;
+    embed = ld.mat("token_embd.weight", c.vocab, H);
+    output = g.find("output.weight") ? ld.mat("output.weight", c.vocab, H) : embed;
+    hc_head = ld.hc("output_hc_", false);
+
+    bool any_ple = false;
+    for (int l = 0; l < c.n_layers; l++) {
+        layers.push_back(ld.layer(l, c.is_full_attn[l], c.compress[l], c.is_ple[l]));
+        any_ple |= c.is_ple[l];
     }
 
     if (any_ple) {
@@ -168,6 +182,24 @@ void Q4Weights::load(const Gguf& g, const Q4Config& c) {
         ple_table.rows = 0;  // too many rows for an int; index with row()
         ple_table.row_bytes = (size_t)(c.ple_dim / gtype_block(t.type)) * gtype_block_bytes(t.type);
     }
+}
+
+void Q4Weights::load_mtp(const Gguf& g, const Q4Config& c) {
+    const std::string arch = g.kv_str("general.architecture");
+    if (arch != "qwen4exp" || (int)g.kv_u64(arch + ".embedding_length") != c.hidden ||
+        (int)g.kv_u64(arch + ".expert_count") != c.n_experts)
+        throw std::runtime_error("the MTP draft head does not belong to this model");
+    const Loader ld{g, c};
+    const int l = c.n_layers, H = c.hidden, HC = c.hc_dim();
+    int compress = 0;  // the MTP block is one more QSA layer with the trunk's block size
+    for (int v : c.compress) compress = std::max(compress, v);
+    layers.push_back(ld.layer(l, true, compress, false));
+    const std::string b = "blk." + std::to_string(l) + ".nextn.";
+    mtp_eh = ld.mat(b + "eh_proj.weight", H, 2 * H);
+    mtp_enorm = ld.vec(b + "enorm.weight", H);
+    mtp_hnorm = ld.vec(b + "hnorm.weight", HC);
+    mtp_head = ld.hc(b + "hc_head_", false);
+    has_mtp = true;
 }
 
 void q4_ple_embed(const Q4Config& c, const Q4Weights& w, const int* toks, int p, float* out) {

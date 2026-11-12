@@ -91,6 +91,9 @@ if(QW_VULKAN)
         "q4_ple_conv|q4_ple.comp|-DPLE_CONV"
         "gated_norm_sigmoid|gated_norm.comp|-DGATE_SIGMOID"
         "deltanet_tiled|deltanet.comp|-DV_TILED"
+        "deltanet_tiled_snap|deltanet.comp|-DV_TILED -DSNAP"
+        "conv1d_snap|conv1d.comp|-DSNAP"
+        "q4_hc_cat|q4_hc.comp|-DHC_CAT"
         "moe_combine_set|moe_combine.comp|-DASSIGN"
         "attention_qsa|attention.comp|-DQSA")
     set(spv_files "")

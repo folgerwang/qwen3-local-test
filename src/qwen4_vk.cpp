@@ -42,7 +42,8 @@ constexpr int GEMM_MIN = 9;         // dense matrices use the tiled GEMM from th
 constexpr int EXPERT_GEMM_MIN = 33; // grouped experts use the tiled GEMM from this many tokens
 constexpr int ATT_PART_MAX = 2048;  // max (tokens x key splits) for split-K attention scratch
 constexpr int MAX_FILLS = 4;        // cache fills per forward pass (each is a CPU repack + upload)
-constexpr VkDeviceSize AUTO_CACHE = 6ull << 30;  // default VRAM budget for cached experts
+constexpr VkDeviceSize AUTO_CACHE = 12ull << 30; // default VRAM budget for cached experts (never more than is free)
+constexpr float DRAFT_P_MIN = 0.5f; // stop drafting when the draft head's best token is less likely than this
 
 // Push-constant layouts (must match the shaders, std430)
 struct PcMat { uint64_t w1, s1, w2, s2, x, y; uint32_t rows, cols, n, x_stride, y_stride, post; float post_scale; };
@@ -50,8 +51,9 @@ struct PcExpert { uint64_t table, toks, x, y; uint32_t woff1, soff1, woff2, soff
 struct PcHc { uint64_t a, b, c; uint32_t dim, hc; float eps; };
 struct PcPleGate { uint64_t key, value, x, wk, wq, wc, gated, pad; uint32_t dim, hc, hist; float eps; };
 struct PcPleConv { uint64_t x, gated, pad, w; uint32_t width, kernel, dil, hist; };
-struct PcConv { uint64_t data, w, state; uint32_t n, channels; };
-struct PcDelta { uint64_t qkv, a, b, neg_a, dt_bias, state, out; uint32_t n, conv_dim, key_dim, n_v_heads, ratio; };
+struct PcNorm { uint64_t x, delta, w, out; uint32_t dim; float eps; };
+struct PcConv { uint64_t data, w, state; uint32_t n, channels; uint64_t snap; uint32_t snap_stride; };
+struct PcDelta { uint64_t qkv, a, b, neg_a, dt_bias, state, out; uint32_t n, conv_dim, key_dim, n_v_heads, ratio; uint64_t snap; uint32_t snap_stride; };
 struct PcGatedNorm { uint64_t o, z, w; uint32_t n_heads; float eps; };
 struct PcQkRope { uint64_t qg, k, v, q_out, kcache, vcache, qn, kn, rope; uint32_t pos, n_heads, n_kv, rope_dim; float eps; };
 struct PcAttn { uint64_t q, kcache, vcache, part; uint32_t pos, n_heads, n_kv, chunk, n_split; float scale; };
@@ -109,6 +111,8 @@ public:
         if (c.head_dim != 256 || c.lin_k_dim != 128 || c.lin_v_dim != 128 || c.conv_kernel != 4 || c.hidden % 256 ||
             c.n_experts > 1024 || c.rope_dim > 256)
             throw std::runtime_error("model dimensions not supported by the Vulkan shaders");
+        // tokens the MTP head drafts per pass; with them a pass is draft_ + 1 tokens, one matvec chunk at most
+        draft_ = w.has_mtp ? std::max(0, std::min(opt.draft, NT - 1)) : 0;
         upload_weights();
         alloc_state();
         setup_experts();
@@ -167,6 +171,7 @@ public:
         gpu_.fill_zero(conv_state_);
         gpu_.fill_zero(rec_state_);
         gpu_.fill_zero(ple_state_);
+        if (draft_) gpu_.fill_zero(hlast_);
         gpu_.submit_wait();
     }
     int pos() const override { return pos_; }
@@ -178,6 +183,7 @@ public:
         gpu_.copy(conv_state_, 0, conv_saved_, 0, conv_state_->size);
         gpu_.copy(rec_state_, 0, rec_saved_, 0, rec_state_->size);
         gpu_.copy(ple_state_, 0, ple_saved_, 0, ple_state_->size);
+        if (draft_) gpu_.copy(hlast_, 0, hlast_saved_, 0, hlast_->size);
         gpu_.submit_wait();
         saved_pos_ = pos_;
     }
@@ -186,22 +192,74 @@ public:
         gpu_.copy(conv_saved_, 0, conv_state_, 0, conv_state_->size);
         gpu_.copy(rec_saved_, 0, rec_state_, 0, rec_state_->size);
         gpu_.copy(ple_saved_, 0, ple_state_, 0, ple_state_->size);
+        if (draft_) gpu_.copy(hlast_saved_, 0, hlast_, 0, hlast_->size);
         gpu_.submit_wait();
         pos_ = saved_pos_;
     }
 
     void forward(const int* tokens, int n, float* logits) override {
-        if (pos_ + n > max_ctx_) throw std::runtime_error("context overflow");
-        for (int t = 0; t < n; t++)
-            if (tokens[t] < 0 || tokens[t] >= c_.vocab) throw std::runtime_error("token id out of range");
+        check_tokens(tokens, n);
         for (int done = 0; done < n;) {
-            const int m = std::min(NMAX, n - done);
-            forward_chunk(tokens + done, m, done + m == n ? logits : nullptr);
+            const int m = std::min(NMAX, n - done), p0 = pos_;
+            forward_chunk(tokens + done, m, done + m == n ? logits : nullptr, false);
+            if (draft_) mtp_run(tokens + done, m, p0, nullptr, true, true);  // keep the draft block's KV cache in step
             done += m;
         }
     }
 
+    // ---- speculative decoding with the MTP draft block ----------------------------------------------------
+    // The block sees, at position p + 1, the trunk's residual streams of position p and the token at p + 1. Its
+    // KV cache is filled from the real trunk states (after every pass); a draft chains its own output instead.
+    int max_draft() const override { return draft_; }
+
+    int draft(int token, int n, int* out) override {
+        n = std::min({n, draft_, max_ctx_ - pos_ - 2});
+        int cnt = 0;
+        mlogits_.resize(c_.vocab);
+        for (int k = 0; k < n; k++) {
+            mtp_run(&token, 1, pos_ + k, mlogits_.data(), k == 0, false);
+            // probability of the best token under the draft head
+            const int best = (int)(std::max_element(mlogits_.begin(), mlogits_.end()) - mlogits_.begin());
+            const float mx = mlogits_[best];
+            double sum = 0;
+            for (float v : mlogits_) sum += std::exp((double)(v - mx));
+            if (1.0 / sum < DRAFT_P_MIN) break;
+            out[cnt++] = token = best;
+        }
+        return cnt;
+    }
+
+    void forward_all(const int* tokens, int n, float* logits) override {
+        if (n < 1 || n > draft_ + 1) throw std::runtime_error("forward_all: bad token count");
+        check_tokens(tokens, n);
+        spec_pos0_ = pos_;
+        spec_toks_.assign(tokens, tokens + n);
+        forward_chunk(tokens, n, logits, true);
+    }
+
+    void accept(int keep) override {
+        const int n = (int)spec_toks_.size();
+        if (keep < 1 || keep > n) throw std::runtime_error("accept: bad count");
+        if (keep < n) {  // roll the recurrent state back to the snapshot taken after token keep - 1
+            gpu_.begin();
+            gpu_.copy(conv_snap_, (VkDeviceSize)(keep - 1) * conv_state_->size, conv_state_, 0, conv_state_->size);
+            gpu_.copy(rec_snap_, (VkDeviceSize)(keep - 1) * rec_state_->size, rec_state_, 0, rec_state_->size);
+            if (ple_hist_)  // the normed rows of this pass are still in the conv input buffer
+                gpu_.copy(ppad_.b, ppad_.off + (VkDeviceSize)keep * c_.hc_dim() * 4, ple_state_, 0, (VkDeviceSize)ple_hist_ * c_.hc_dim() * 4);
+            gpu_.submit_wait();
+            pos_ = spec_pos0_ + keep;
+        }
+        mtp_run(spec_toks_.data(), keep, spec_pos0_, nullptr, true, true);
+        spec_toks_.clear();
+    }
+
 private:
+    void check_tokens(const int* tokens, int n) const {
+        if (pos_ + n > max_ctx_) throw std::runtime_error("context overflow");
+        for (int t = 0; t < n; t++)
+            if (tokens[t] < 0 || tokens[t] >= c_.vocab) throw std::runtime_error("token id out of range");
+    }
+
     const Q4Config& c_;
     const Q4Weights& w_;
     int max_ctx_;
@@ -216,6 +274,18 @@ private:
     std::vector<GLayer> L_;
     GM output_;
     GHc hc_head_;
+    // MTP draft block (layer index c_.n_layers of L_ / w_.layers)
+    int draft_ = 0, spec_pos0_ = 0;
+    std::vector<int> spec_toks_;
+    std::vector<float> mlogits_;
+    GM mtp_eh_;
+    GHc mtp_head_;
+    Ptr mtp_enorm_, mtp_hnorm_, mx_, mh_, mcat_, men_, memb_;
+    Buf* hme_ = nullptr;          // token embeddings of the draft block's rows (CPU -> GPU)
+    Buf* hlast_ = nullptr;        // trunk residual of the last position, waiting for the token that follows it
+    Buf* hlast_saved_ = nullptr;
+    Buf* conv_snap_ = nullptr;    // recurrent state after each token of a speculative pass, [draft_][state]
+    Buf* rec_snap_ = nullptr;
     Ptr rope_;
     std::vector<int> slot_;      // per layer: index into the full-attn or linear-attn state arrays
     std::vector<int> qsa_slot_;  // per layer: index into hqsa_ or -1
@@ -252,6 +322,7 @@ private:
     std::vector<float> cg_, cu_, cx_;
     std::vector<gq::GMat> cmats_;
     std::vector<uint64_t> usage_;             // selection counts per key (persisted)
+    std::vector<uint32_t> recent_;            // the same for this session only
     Buf* hxn_ = nullptr;                      // block input of the layer (GPU -> CPU)
     Buf* htab_ = nullptr;                     // entries | toks | comb tables written by the CPU
     Buf* hcy_ = nullptr;                      // expert outputs computed on the CPU (CPU -> GPU)
@@ -321,7 +392,14 @@ private:
         output_ = up_dense(w_.output);
         hc_head_ = up_hc(w_.hc_head);
         int nf = 0, nl = 0, nq = 0;
-        for (int l = 0; l < c_.n_layers; l++) {
+        const int n_blocks = c_.n_layers + (draft_ ? 1 : 0);
+        if (draft_) {
+            mtp_eh_ = up_dense(w_.mtp_eh);
+            mtp_enorm_ = up_norm_minus1(w_.mtp_enorm);  // add_rmsnorm multiplies by (1 + w)
+            mtp_hnorm_ = up_f32(w_.mtp_hnorm);
+            mtp_head_ = up_hc(w_.mtp_head);
+        }
+        for (int l = 0; l < n_blocks; l++) {
             const Q4Layer& W = w_.layers[l];
             GLayer g;
             g.hc_attn = up_hc(W.hc_attn);
@@ -371,13 +449,13 @@ private:
 
     void alloc_state() {
         const int H = c_.hidden, HC = c_.hc_dim(), TK = c_.top_k;
-        const int n_full = (int)std::count(c_.is_full_attn.begin(), c_.is_full_attn.end(), true);
-        const int n_lin = c_.n_layers - n_full;
+        const int n_lin = (int)std::count(c_.is_full_attn.begin(), c_.is_full_attn.end(), false);
+        const int n_full = (int)L_.size() - n_lin;  // includes the draft block
         const int n_qsa = (int)std::count_if(qsa_slot_.begin(), qsa_slot_.end(), [](int s) { return s >= 0; });
         ple_hist_ = c_.ple_ngram > 0 ? (c_.ple_kernel - 1) * c_.ple_ngram : 0;
         int max_blocks = 1;
-        for (int l = 0; l < c_.n_layers; l++)
-            if (c_.compress[l] > 0) max_blocks = std::max(max_blocks, max_ctx_ / c_.compress[l] + 1);
+        for (size_t l = 0; l < L_.size(); l++)
+            if (w_.layers[l].compress > 0) max_blocks = std::max(max_blocks, max_ctx_ / w_.layers[l].compress + 1);
         mask_words_ = (max_blocks + 31) / 32;
         toks_.assign(max_ctx_, 0);
 
@@ -409,7 +487,14 @@ private:
         selw_ = act((size_t)NMAX * TK);
         comb_ = act((size_t)NMAX * TK * 2);
         sel_ = arena_.alloc((VkDeviceSize)NMAX * TK * 4);
-        logits_ = arena_.alloc((VkDeviceSize)c_.vocab * 4);
+        logits_ = arena_.alloc((VkDeviceSize)c_.vocab * 4 * (draft_ + 1));
+        if (draft_) {
+            mx_ = act((size_t)NMAX * HC);
+            mh_ = act((size_t)NMAX * HC);
+            mcat_ = act((size_t)NMAX * HC * 2);
+            men_ = act((size_t)NMAX * H);
+            memb_ = act((size_t)NMAX * H);
+        }
         if (ple_hist_) {
             emb_ = act((size_t)NMAX * H);
             pkey_ = act((size_t)NMAX * HC);
@@ -429,6 +514,13 @@ private:
         conv_saved_ = gpu_.create(cs, Mem::Device);
         rec_saved_ = gpu_.create(rs, Mem::Device);
         ple_saved_ = gpu_.create(ps, Mem::Device);
+        if (draft_) {
+            hme_ = gpu_.create((VkDeviceSize)NMAX * H * 4, Mem::HostUpload);
+            hlast_ = gpu_.create((VkDeviceSize)HC * 4, Mem::Device);
+            hlast_saved_ = gpu_.create((VkDeviceSize)HC * 4, Mem::Device);
+            conv_snap_ = gpu_.create(cs * draft_, Mem::Device);
+            rec_snap_ = gpu_.create(rs * draft_, Mem::Device);
+        }
         hx_ = gpu_.create((VkDeviceSize)NMAX * HC * 4, Mem::HostUpload);
         hemb_ = gpu_.create((VkDeviceSize)NMAX * H * 4, Mem::HostUpload);
         hsel_ = gpu_.create((VkDeviceSize)NMAX * TK * 4, Mem::HostRead);
@@ -438,13 +530,13 @@ private:
         htab_toks_ = align256(ne * sizeof(ExpertEntry));
         htab_comb_ = align256(htab_toks_ + ne * 4);
         htab_ = gpu_.create(htab_comb_ + ne * 8, Mem::HostUpload);
-        hlog_ = gpu_.create((VkDeviceSize)c_.vocab * 4, Mem::HostRead);
+        hlog_ = gpu_.create((VkDeviceSize)c_.vocab * 4 * (draft_ + 1), Mem::HostRead);
         hqsa_ = gpu_.create(std::max<VkDeviceSize>((VkDeviceSize)n_qsa * NMAX * H * 4, 256), Mem::HostRead);
         hmask_ = gpu_.create((VkDeviceSize)NMAX * mask_words_ * 4, Mem::HostUpload);
     }
 
     // ---- experts ------------------------------------------------------------------------------
-    size_t n_keys() const { return (size_t)c_.n_layers * c_.n_experts; }
+    size_t n_keys() const { return L_.size() * c_.n_experts; }
     uint64_t slot_addr(std::pair<int, int> cs) const { return slots_[cs.first][cs.second].buf->addr + slots_[cs.first][cs.second].off; }
 
     static void write_part(const gq::GMat& m, uint8_t* d, uint32_t s_off_rel) {
@@ -473,7 +565,7 @@ private:
 
     void setup_experts() {
         // per-layer slot layout: [gate][up][down], Q8_0 parts as planar weights followed by their scales
-        for (int l = 0; l < c_.n_layers; l++) {
+        for (int l = 0; l < (int)L_.size(); l++) {
             const Q4Layer& W = w_.layers[l];
             GLayer& g = L_[l];
             const char* cu = codec(W.ex_gate.type);
@@ -502,6 +594,7 @@ private:
             if (it == cls_size_.end()) cls_size_.push_back(o);
         }
         usage_.assign(n_keys(), 0);
+        recent_.assign(n_keys(), 0);
         load_stats();
 
         // VRAM cache: the budget is split between the slot-size classes in proportion to their experts' bytes.
@@ -513,7 +606,7 @@ private:
         const size_t nc = cls_size_.size();
         std::vector<size_t> cls_keys(nc, 0);
         VkDeviceSize total = 0;
-        for (int l = 0; l < c_.n_layers; l++) {
+        for (int l = 0; l < (int)L_.size(); l++) {
             cls_keys[L_[l].cls] += c_.n_experts;
             total += L_[l].slot_size * c_.n_experts;
         }
@@ -582,8 +675,9 @@ private:
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
 
-    // Moves `key` into the cache if it is used clearly more than the least used cached expert of its class
-    // (not counting slots touched in the current pass). Called between passes.
+    // Moves `key` into the cache if it has been used more in this session than the least used cached expert of
+    // its class (not counting slots touched in the current pass). Called between passes. The persisted counts
+    // only order the preload: what is hot depends on the conversation.
     void try_fill(int key) {
         const int k = L_[key / c_.n_experts].cls;
         auto& sl = slots_[k];
@@ -591,11 +685,11 @@ private:
         for (int i = 0; i < (int)sl.size(); i++) {
             if (sl[i].key < 0) { v = i; break; }
             if (sl[i].tick == tick_) continue;
-            if (v < 0 || usage_[sl[i].key] < usage_[sl[v].key]) v = i;
+            if (v < 0 || recent_[sl[i].key] < recent_[sl[v].key]) v = i;
         }
         if (v < 0) return;
         if (sl[v].key >= 0) {
-            if (usage_[key] < usage_[sl[v].key] + usage_[sl[v].key] / 4 + 16) return;
+            if (recent_[key] < recent_[sl[v].key] + 3) return;
             where_[sl[v].key] = {-1, -1};
         }
         up_.put_fn({sl[v].buf, sl[v].off}, cls_size_[k], [&](void* d) { write_expert(key, (uint8_t*)d); });
@@ -609,8 +703,9 @@ private:
         if (opt_.stats_path.empty()) return;
         std::ifstream f(opt_.stats_path, std::ios::binary);
         if (!f) return;
-        std::vector<uint64_t> v(n_keys());
-        if (f.read((char*)v.data(), v.size() * 8)) usage_ = v;
+        std::vector<uint64_t> v(n_keys(), 0);  // the draft block's counts are the tail and may be missing
+        f.read((char*)v.data(), v.size() * 8);
+        if ((size_t)f.gcount() >= (size_t)c_.n_layers * c_.n_experts * 8) usage_ = v;
     }
     void save_stats() {
         if (opt_.stats_path.empty()) return;
@@ -652,9 +747,9 @@ private:
         gpu_.dispatch("q4_hc_mix", pm, groups(H, 256), n);
         gpu_.barrier();
     }
-    // x_[t][s] += 2 * sigmoid(inj_[t][s] / hc) * mix_[t]
-    void hc_combine(int n) {
-        PcHc pc{x_.addr(), inj_.addr(), mix_.addr(), (uint32_t)c_.hidden, (uint32_t)c_.hc, c_.rms_eps};
+    // x[t][s] += 2 * sigmoid(inj_[t][s] / hc) * mix_[t]
+    void hc_combine(uint64_t x, int n) {
+        PcHc pc{x, inj_.addr(), mix_.addr(), (uint32_t)c_.hidden, (uint32_t)c_.hc, c_.rms_eps};
         gpu_.dispatch("q4_hc_combine", pc, groups(c_.hidden, 256), n);
         gpu_.barrier();
     }
@@ -678,7 +773,8 @@ private:
         gpu_.barrier();
     }
 
-    void deltanet(int l, int n) {
+    // snap: also store the recurrent state after every token but the last (speculative pass)
+    void deltanet(int l, int n, bool snap) {
         const GLayer& g = L_[l];
         const int s = slot_[l], H = c_.hidden;
         mat(g.qkv, xn_.addr(), qkv_.addr(), n, H, 0, 0, "dn_qkv");
@@ -687,14 +783,16 @@ private:
         mat(g.beta, xn_.addr(), b_.addr(), n, H, 0, 0, "dn_beta");
         gpu_.barrier();
         const VkDeviceSize cs = (VkDeviceSize)(c_.conv_kernel - 1) * c_.conv_dim() * 4;
-        PcConv pcc{qkv_.addr(), g.conv.addr(), conv_state_->addr + s * cs, (uint32_t)n, (uint32_t)c_.conv_dim()};
-        gpu_.dispatch("conv1d", pcc, groups(c_.conv_dim(), 256));
+        PcConv pcc{qkv_.addr(), g.conv.addr(), conv_state_->addr + s * cs, (uint32_t)n, (uint32_t)c_.conv_dim(),
+                   snap ? conv_snap_->addr + s * cs : 0, (uint32_t)conv_state_->size};
+        gpu_.dispatch(snap ? "conv1d_snap" : "conv1d", pcc, groups(c_.conv_dim(), 256));
         gpu_.barrier();
         const VkDeviceSize rs = (VkDeviceSize)c_.lin_v_heads * c_.lin_k_dim * c_.lin_v_dim * 4;
         PcDelta pcd{qkv_.addr(), a_.addr(), b_.addr(), g.neg_a.addr(), g.dt_bias.addr(), rec_state_->addr + s * rs,
                     core_.addr(), (uint32_t)n, (uint32_t)c_.conv_dim(), (uint32_t)c_.lin_key_dim(),
-                    (uint32_t)c_.lin_v_heads, (uint32_t)(c_.lin_v_heads / c_.lin_k_heads)};
-        gpu_.dispatch("deltanet_tiled", pcd, c_.lin_v_heads, c_.lin_v_dim / 16);
+                    (uint32_t)c_.lin_v_heads, (uint32_t)(c_.lin_v_heads / c_.lin_k_heads),
+                    snap ? rec_snap_->addr + s * rs : 0, (uint32_t)rec_state_->size};
+        gpu_.dispatch(snap ? "deltanet_tiled_snap" : "deltanet_tiled", pcd, c_.lin_v_heads, c_.lin_v_dim / 16);
         gpu_.barrier();
         PcGatedNorm pcg{core_.addr(), z_.addr(), g.lnorm.addr(), (uint32_t)c_.lin_v_heads, c_.rms_eps};
         gpu_.dispatch("gated_norm_sigmoid", pcg, n, c_.lin_v_heads);
@@ -705,7 +803,7 @@ private:
 
     // Returns with a command buffer open; `deferred` collects the QSA layers whose keys the CPU caches after
     // the pass (dense attention), the others sync here to get their selection mask.
-    void attention(int l, int n, std::vector<int>& deferred) {
+    void attention(int l, int n, int pos, std::vector<int>& deferred) {
         const GLayer& g = L_[l];
         const int H = c_.hidden, AD = c_.n_heads * c_.head_dim;
         const VkDeviceSize kv = (VkDeviceSize)slot_[l] * max_ctx_ * c_.n_kv_heads * c_.head_dim * 4;
@@ -713,13 +811,13 @@ private:
         if (qsa_slot_[l] >= 0) {
             const VkDeviceSize ho = (VkDeviceSize)qsa_slot_[l] * NMAX * H * 4;
             gpu_.copy(xn_.b, xn_.off, hqsa_, ho, (VkDeviceSize)n * H * 4);
-            if (qsa_.needs_select(l, pos_, n)) {
+            if (qsa_.needs_select(l, pos, n)) {
                 gpu_.barrier();
                 gpu_.submit_wait();
                 const float* xn = (const float*)(hqsa_->map + ho);
                 std::vector<std::vector<int>> blocks;
-                qsa_.update(l, xn, n, pos_);
-                qsa_.select(l, xn, n, pos_, blocks);
+                qsa_.update(l, xn, n, pos);
+                qsa_.select(l, xn, n, pos, blocks);
                 uint32_t* mask = (uint32_t*)hmask_->map;
                 for (int t = 0; t < n; t++) {
                     uint32_t* m = mask + (size_t)t * mask_words_;
@@ -738,23 +836,23 @@ private:
         mat(g.v, xn_.addr(), vb_.addr(), n, H, 0, 0, "attn_v");
         gpu_.barrier();
         PcQkRope pr{qg_.addr(), kb_.addr(), vb_.addr(), qo_.addr(), kcache_->addr + kv, vcache_->addr + kv,
-                    g.qn.addr(), g.kn.addr(), rope_.addr(), (uint32_t)pos_, (uint32_t)c_.n_heads,
+                    g.qn.addr(), g.kn.addr(), rope_.addr(), (uint32_t)pos, (uint32_t)c_.n_heads,
                     (uint32_t)c_.n_kv_heads, (uint32_t)c_.rope_dim, c_.rms_eps};
         gpu_.dispatch("qk_norm_rope", pr, n, c_.n_heads + c_.n_kv_heads);
         gpu_.barrier();
         // split-K over keys: many splits when few tokens (decode), few when the batch is already wide
-        const int maxlen = pos_ + n;
+        const int maxlen = pos + n;
         int splits = n <= NT ? (maxlen + 255) / 256 : (maxlen + 1023) / 1024;
         splits = std::max(1, std::min(splits, std::min(64, ATT_PART_MAX / n)));
         const int chunk = (maxlen + splits - 1) / splits;
         const float scale = 1.0f / std::sqrt((float)c_.head_dim);
         if (masked) {
-            PcAttnQsa pa{qo_.addr(), kcache_->addr + kv, vcache_->addr + kv, part_.addr(), (uint32_t)pos_, (uint32_t)c_.n_heads,
+            PcAttnQsa pa{qo_.addr(), kcache_->addr + kv, vcache_->addr + kv, part_.addr(), (uint32_t)pos, (uint32_t)c_.n_heads,
                          (uint32_t)c_.n_kv_heads, (uint32_t)chunk, (uint32_t)splits, scale, hmask_->addr,
-                         (uint32_t)c_.compress[l], (uint32_t)mask_words_};
+                         (uint32_t)w_.layers[l].compress, (uint32_t)mask_words_};
             gpu_.dispatch("attention_qsa", pa, n, c_.n_heads, splits);
         } else {
-            PcAttn pa{qo_.addr(), kcache_->addr + kv, vcache_->addr + kv, part_.addr(), (uint32_t)pos_, (uint32_t)c_.n_heads,
+            PcAttn pa{qo_.addr(), kcache_->addr + kv, vcache_->addr + kv, part_.addr(), (uint32_t)pos, (uint32_t)c_.n_heads,
                       (uint32_t)c_.n_kv_heads, (uint32_t)chunk, (uint32_t)splits, scale};
             gpu_.dispatch("attention", pa, n, c_.n_heads, splits);
         }
@@ -803,6 +901,7 @@ private:
             if (per_[e].empty()) continue;
             const int key = l * E + e;
             usage_[key] += per_[e].size();
+            recent_[key] += (uint32_t)per_[e].size();
             if (where_[key].first < 0) {
                 misses_ += per_[e].size();
                 cpu_experts_.push_back(e);
@@ -898,7 +997,9 @@ private:
         gpu_.barrier();
     }
 
-    void forward_chunk(const int* tokens, int n, float* logits) {
+    // One trunk pass over n tokens. logits: of the last token, or with `spec` (a speculative pass of at most
+    // draft_ + 1 tokens, see forward_all) of every token, with per-token snapshots of the recurrent state.
+    void forward_chunk(const int* tokens, int n, float* logits, bool spec) {
         const int H = c_.hidden, HC = c_.hc_dim();
         float* hx = (float*)hx_->map;
         for (int t = 0; t < n; t++) toks_[pos_ + t] = tokens[t];
@@ -925,25 +1026,78 @@ private:
             const GLayer& g = L_[l];
             if (w_.layers[l].ple) ple(l, n);
             hc_mix(g.hc_attn, x_.addr(), n);
-            if (w_.layers[l].full_attn) attention(l, n, deferred);
-            else deltanet(l, n);
-            hc_combine(n);
+            if (w_.layers[l].full_attn) attention(l, n, pos_, deferred);
+            else deltanet(l, n, spec && n > 1);
+            hc_combine(x_.addr(), n);
             hc_mix(g.hc_ffn, x_.addr(), n);
             moe(l, n);
-            hc_combine(n);
+            hc_combine(x_.addr(), n);
         }
-        if (logits) {  // the final mixer is the output norm; only the last token is needed
-            hc_mix(hc_head_, x_.addr() + (uint64_t)(n - 1) * HC * 4, 1);
-            mat(output_, xn_.addr(), logits_.addr(), 1, H, 0, 0, "lm_head");
+        const int n_out = spec ? n : 1;
+        if (logits) {  // the final mixer is the output norm
+            hc_mix(hc_head_, x_.addr() + (uint64_t)(n - n_out) * HC * 4, n_out);
+            mat(output_, xn_.addr(), logits_.addr(), n_out, H, 0, 0, "lm_head");
+            gpu_.barrier();
+            gpu_.copy(logits_.b, logits_.off, hlog_, 0, (VkDeviceSize)c_.vocab * 4 * n_out);
+        }
+        gpu_.barrier();
+        gpu_.submit_wait();
+        if (logits) std::memcpy(logits, hlog_->map, (size_t)c_.vocab * 4 * n_out);
+        for (int l : deferred)
+            qsa_.update(l, (const float*)(hqsa_->map + (size_t)qsa_slot_[l] * NMAX * H * 4), n, pos_);
+        pos_ += n;
+    }
+
+    // Runs the draft block on n rows at positions p0.. : row i pairs the token toks[i] with the residual streams
+    // of the position before it. from_trunk: those are the pending row (hlast_) followed by rows 0..n-2 of the
+    // last trunk pass (x_); otherwise (a further draft step, n == 1) the block's own previous output. commit:
+    // row n-1 of the trunk pass becomes the new pending row. logits: of the last row (the token after toks[n-1]).
+    void mtp_run(const int* toks, int n, int p0, float* logits, bool from_trunk, bool commit) {
+        const int H = c_.hidden, HC = c_.hc_dim(), l = c_.n_layers;
+        const GLayer& g = L_[l];
+        float* he = (float*)hme_->map;
+        cpu_.parallel_for(n, [&](int64_t b, int64_t e) {
+            for (int64_t t = b; t < e; t++) gq::dequant_row(w_.embed.type, w_.embed.row(toks[t]), H, he + (size_t)t * H);
+        }, 16);
+        gpu_.begin();
+        gpu_.copy(hme_, 0, memb_.b, memb_.off, (VkDeviceSize)n * H * 4);
+        if (from_trunk) {
+            gpu_.copy(hlast_, 0, mh_.b, mh_.off, (VkDeviceSize)HC * 4);
+            if (n > 1) gpu_.copy(x_.b, x_.off, mh_.b, mh_.off + (VkDeviceSize)HC * 4, (VkDeviceSize)(n - 1) * HC * 4);
+        } else {
+            gpu_.copy(mx_.b, mx_.off, mh_.b, mh_.off, (VkDeviceSize)HC * 4);
+        }
+        gpu_.barrier();
+        if (commit) gpu_.copy(x_.b, x_.off + (VkDeviceSize)(n - 1) * HC * 4, hlast_, 0, (VkDeviceSize)HC * 4);
+        // stream s of the block input = eh_proj(norm(embedding) | norm(stream s of the residual))
+        PcNorm pe{memb_.addr(), 0, mtp_enorm_.addr(), men_.addr(), (uint32_t)H, c_.rms_eps};
+        gpu_.dispatch("add_rmsnorm", pe, n);
+        PcHc ph{mh_.addr(), mtp_hnorm_.addr(), xnorm_.addr(), (uint32_t)H, (uint32_t)c_.hc, c_.rms_eps};
+        gpu_.dispatch("q4_hc_norm", ph, n, c_.hc);
+        gpu_.barrier();
+        PcHc pcat{men_.addr(), xnorm_.addr(), mcat_.addr(), (uint32_t)H, (uint32_t)c_.hc, c_.rms_eps};
+        gpu_.dispatch("q4_hc_cat", pcat, groups(2 * H, 256), n * c_.hc);
+        gpu_.barrier();
+        mat(mtp_eh_, mcat_.addr(), mx_.addr(), n * c_.hc, 2 * H, 0, 0, "mtp_eh");
+        gpu_.barrier();
+        std::vector<int> deferred;
+        hc_mix(g.hc_attn, mx_.addr(), n);
+        attention(l, n, p0, deferred);
+        hc_combine(mx_.addr(), n);
+        hc_mix(g.hc_ffn, mx_.addr(), n);
+        moe(l, n);
+        hc_combine(mx_.addr(), n);
+        if (logits) {
+            hc_mix(mtp_head_, mx_.addr() + (uint64_t)(n - 1) * HC * 4, 1);
+            mat(output_, xn_.addr(), logits_.addr(), 1, H, 0, 0, "mtp_head");
             gpu_.barrier();
             gpu_.copy(logits_.b, logits_.off, hlog_, 0, (VkDeviceSize)c_.vocab * 4);
         }
         gpu_.barrier();
         gpu_.submit_wait();
         if (logits) std::memcpy(logits, hlog_->map, (size_t)c_.vocab * 4);
-        for (int l : deferred)
-            qsa_.update(l, (const float*)(hqsa_->map + (size_t)qsa_slot_[l] * NMAX * H * 4), n, pos_);
-        pos_ += n;
+        for (int dl : deferred)
+            qsa_.update(dl, (const float*)(hqsa_->map + (size_t)qsa_slot_[dl] * NMAX * H * 4), n, p0);
     }
 };
 

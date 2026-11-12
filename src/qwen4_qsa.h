@@ -19,9 +19,9 @@ public:
     QsaIndexer(const Q4Config& c, const Q4Weights& w, int max_ctx, ThreadPool& pool)
         : c_(c), w_(w), max_ctx_(max_ctx), pool_(pool) {
         int n = 0;
-        slot_.assign(c.n_layers, -1);
-        for (int l = 0; l < c.n_layers; l++)
-            if (c.compress[l] > 0) slot_[l] = n++;
+        slot_.assign(w.layers.size(), -1);
+        for (size_t l = 0; l < w.layers.size(); l++)
+            if (w.layers[l].full_attn && w.layers[l].compress > 0) slot_[l] = n++;
         raw_.assign((size_t)n * max_ctx * c.idx_dim, 0.f);
         pooled_.assign((size_t)n * (max_ctx / 2 + 1) * c.idx_dim, 0.f);
         for (int i = 0; i < c.rope_dim / 2; i++)
@@ -29,9 +29,9 @@ public:
     }
 
     bool active(int l) const { return slot_[l] >= 0; }
-    int top_blocks(int l) const { return c_.idx_budget / c_.compress[l]; }
+    int top_blocks(int l) const { return c_.idx_budget / w_.layers[l].compress; }
     // True when some token of [pos, pos + n) sees more complete blocks than it may attend to.
-    bool needs_select(int l, int pos, int n) const { return active(l) && (pos + n) / c_.compress[l] > top_blocks(l); }
+    bool needs_select(int l, int pos, int n) const { return active(l) && (pos + n) / w_.layers[l].compress > top_blocks(l); }
 
     // Caches the raw keys of tokens [pos, pos + n) from the layer's block input xn[n][hidden] and pools the
     // blocks they complete. Positions below `pos` must have been fed before (they are never rewritten).
