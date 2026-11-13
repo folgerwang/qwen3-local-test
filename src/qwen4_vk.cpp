@@ -14,6 +14,8 @@
 //   * hyper-connections replace the layer norms; PLE injects hashed n-gram embeddings (gathered on the CPU)
 //   * QSA: the indexer runs on the CPU from the block input the GPU copies out; beyond the token budget each
 //     full-attention layer syncs so the CPU can hand the selection mask to the attention shader.
+#include "expert_predictor.h"
+#include <future>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -119,6 +121,7 @@ public:
             throw std::runtime_error("model dimensions not supported by the Vulkan shaders");
         // tokens the MTP head drafts per pass; with them a pass is draft_ + 1 tokens, one matvec chunk at most
         draft_ = w.has_mtp ? std::max(0, std::min(opt.draft, NT - 1)) : 0;
+        if (const char* tp = std::getenv("QW_TRACE")) trace_ = std::fopen(tp, "ab");
         sys_free0_ = qw_system_free_vram(gpu_.device_name());  // before our buffers: Windows only counts them once used
         upload_weights();
         alloc_state();
@@ -184,6 +187,13 @@ public:
                          (unsigned long long)distinct, tot ? 100.0 * best / tot : 0.0);
         }
         save_stats();
+        if (trace_) std::fclose(trace_);
+        if (pred_ready_) {
+            if (pred_job_.valid()) pred_job_.get();
+            pred_.save();
+            std::fprintf(stderr, "[vulkan] expert predictor: %llu training steps, loss %.3f, %.2fs\n",
+                         (unsigned long long)pred_.trained(), pred_.loss(), t_pred_);
+        }
     }
 
     void reset() override {
@@ -346,6 +356,18 @@ private:
     std::vector<gq::GMat> cmats_;
     std::vector<uint64_t> usage_;             // selection counts per key (persisted)
     std::vector<uint32_t> recent_;            // the same for this session only
+    std::vector<float> heat_;                 // QW_EMA=passes: use counts decayed with that time constant
+    float ema_ = 0, ema_margin_ = 2.5f;
+    // QW_PRED=1: the cache follows a model trained while the engine runs (expert_predictor.h)
+    ExpertPredictor pred_;
+    bool use_pred_ = false, pred_ready_ = false;
+    float pred_margin_ = 1.f;
+    double t_pred_ = 0;
+    std::future<void> pred_job_;
+    std::vector<std::pair<int, uint32_t>> pass_used_;
+    float heat(int key) const { return use_pred_ ? pred_.score(key) : ema_ > 0 ? heat_[key] : (float)recent_[key]; }
+    float fill_margin() const { return use_pred_ ? pred_margin_ : ema_ > 0 ? ema_margin_ : (float)FILL_MARGIN; }
+    FILE* trace_ = nullptr;                   // QW_TRACE=path: tokens and expert selections of every pass
     Buf* hxn_ = nullptr;                      // block input of the layer (GPU -> CPU)
     Buf* htab_ = nullptr;                     // entries | toks | comb tables written by the CPU
     Buf* hcy_ = nullptr;                      // expert outputs computed on the CPU (CPU -> GPU)
@@ -679,6 +701,11 @@ private:
         }
         usage_.assign(n_keys(), 0);
         recent_.assign(n_keys(), 0);
+        if (const char* ev = std::getenv("QW_EMA")) ema_ = (float)std::atof(ev);
+        if (const char* ev = std::getenv("QW_EMA_MARGIN")) ema_margin_ = (float)std::atof(ev);
+        heat_.assign(n_keys(), 0.f);
+        use_pred_ = std::getenv("QW_PRED") != nullptr;
+        if (const char* ev = std::getenv("QW_PRED_MARGIN")) pred_margin_ = (float)std::atof(ev);
         load_stats();
 
         // VRAM cache: the budget is split between the slot-size classes in proportion to their experts' bytes.
@@ -774,11 +801,11 @@ private:
         for (int i = 0; i < (int)sl.size(); i++) {
             if (sl[i].key < 0) { v = i; break; }
             if (sl[i].tick == tick_) continue;
-            if (v < 0 || recent_[sl[i].key] < recent_[sl[v].key]) v = i;
+            if (v < 0 || heat(sl[i].key) < heat(sl[v].key)) v = i;
         }
         if (v < 0) return;
         if (sl[v].key >= 0) {
-            if (recent_[key] < recent_[sl[v].key] + FILL_MARGIN) return;
+            if (heat(key) < heat(sl[v].key) + fill_margin()) return;
             where_[sl[v].key] = {-1, -1};
         }
         up_.put_fn({sl[v].buf, sl[v].off}, cls_size_[k], [&](void* d) { write_expert(key, (uint8_t*)d); });
@@ -976,6 +1003,11 @@ private:
 
         // split the selections into cached (GPU) and other (CPU) experts, build the GPU tables
         const uint32_t* sel = (const uint32_t*)hsel_->map;
+        if (trace_) {  // QW_TRACE: [1, layer, n, selections[n * top_k]]
+            const uint32_t h[3] = {1, (uint32_t)l, (uint32_t)n};
+            std::fwrite(h, 4, 3, trace_);
+            std::fwrite(sel, 4, (size_t)n * TK, trace_);
+        }
         per_.resize(E);
         for (auto& p : per_) p.clear();
         for (int i = 0; i < n * TK; i++) per_[sel[i]].push_back(i);  // selection index = t * TK + k
@@ -991,6 +1023,8 @@ private:
             const int key = l * E + e;
             usage_[key] += per_[e].size();
             recent_[key] += (uint32_t)per_[e].size();
+            if (ema_ > 0) heat_[key] += (float)per_[e].size();
+            if (use_pred_) pass_used_.push_back({key, (uint32_t)per_[e].size()});
             if (where_[key].first < 0) {
                 misses_ += per_[e].size();
                 cpu_experts_.push_back(e);
@@ -1092,6 +1126,11 @@ private:
         const int H = c_.hidden, HC = c_.hc_dim();
         float* hx = (float*)hx_->map;
         for (int t = 0; t < n; t++) toks_[pos_ + t] = tokens[t];
+        if (trace_) {  // QW_TRACE: [0, position, n, tokens[n]]
+            const uint32_t h[3] = {0, (uint32_t)pos_, (uint32_t)n};
+            std::fwrite(h, 4, 3, trace_);
+            std::fwrite(tokens, 4, (size_t)n, trace_);
+        }
         cpu_.parallel_for(n, [&](int64_t b, int64_t e) {
             for (int64_t t = b; t < e; t++) {
                 float* x = hx + (size_t)t * HC;
@@ -1100,20 +1139,38 @@ private:
                 if (ple_hist_) q4_ple_embed(c_, w_, toks_.data(), pos_ + (int)t, (float*)hemb_->map + (size_t)t * H);
             }
         }, 4);
+        if (use_pred_) {  // learn from the previous pass and rescore the experts
+            auto tq0 = std::chrono::steady_clock::now();
+            if (!pred_ready_) {
+                const char* pf = std::getenv("QW_PRED_FILE");
+                pred_.init(n_keys(), usage_, pf ? pf : opt_.stats_path.empty() ? "" : opt_.stats_path + ".pred");
+                pred_ready_ = true;
+                std::fprintf(stderr, "[vulkan] expert predictor: %llu training steps loaded\n",(unsigned long long)pred_.trained());
+            }
+            // The step for a pass runs on its own thread during the following pass (the trunk mostly waits
+            // for the GPU), so the scores the fills below read are one pass behind.
+            if (pred_job_.valid()) pred_job_.get();
+            t_pred_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - tq0).count();
+        }
         // cache fills queued by the previous pass
         // (the most used of the experts the previous pass missed, over all layers)
         {
             const size_t nf = std::min<size_t>(MAX_FILLS, pending_.size());
             std::partial_sort(pending_.begin(), pending_.begin() + nf, pending_.end(),
-                              [&](int a, int b) { return recent_[a] != recent_[b] ? recent_[a] > recent_[b] : a < b; });
+                              [&](int a, int b) { return heat(a) != heat(b) ? heat(a) > heat(b) : a < b; });
             auto tf0 = std::chrono::steady_clock::now();
             for (size_t i = 0; i < nf; i++)
                 if (where_[pending_[i]].first < 0) try_fill(pending_[i]);
             t_fill_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - tf0).count();
             pending_.clear();
         }
+        if (use_pred_ && !pass_used_.empty()) {
+            pred_job_ = std::async(std::launch::async, [this, used = std::move(pass_used_)] { pred_.step(used); });
+            pass_used_.clear();
+        }
         up_.flush();
         tick_++;
+        if (ema_ > 0) { const float k = 1.f - 1.f / ema_; for (float& h : heat_) h *= k; }
         gpu_.begin();
         gpu_.copy(hx_, 0, x_.b, x_.off, (VkDeviceSize)n * HC * 4);
         if (ple_hist_) gpu_.copy(hemb_, 0, emb_.b, emb_.off, (VkDeviceSize)n * H * 4);

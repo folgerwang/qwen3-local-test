@@ -95,3 +95,21 @@ Committed to `main` with this file: the expert cache sized from the VRAM that is
 and K/V caches that start at 16,384 tokens and double on demand up to the context limit (taking VRAM back from
 the expert cache). At the 256K default context this brought
 generation from 11 to about 24 tok/s.
+
+## Expert cache rules (2026-11-13, second machine: RTX 5090 32 GB, about 3.4 GB held by other programs)
+
+- `QW_TRACE=path` records the tokens and expert selections of every pass (for offline replay of cache rules).
+- `QW_EMA=128` ranks experts by use counts decayed over that many passes (`QW_EMA_MARGIN`, default 2.5).
+- `QW_PRED=1` ranks them with a model trained while the engine runs (`src/expert_predictor.h`; margin
+  `QW_PRED_MARGIN`, default 1.0, 0.6 measured better; weights in `<stats file>.pred` or `QW_PRED_FILE`). Its step
+  runs on its own thread during the next pass: on the main thread it cost about 2.9 ms per pass and lost speed.
+- Both are off by default. Measured on one greedy five-turn coding workload (about 2,900 generated tokens, 850
+  passes), automatic 18.8 GB cache: session counts 52.1-52.6 tok/s, decayed counts 53.9-54.0, predictor 55.2
+  (single run, margin 0.6). With a 15 GB cache: 46.1-46.9 against 49.8-50.0 for decayed counts.
+- Cache size on that machine: 12 GB 43.4 tok/s, 15 GB 46.5, 18.8 GB 52.5.
+- A fill costs about 0.17 ms of CPU repack, a CPU-computed expert lookup about 30 us.
+- In replay of four short sessions, a rule that knows the future serves about 10 points more generation lookups
+  from the GPU than any rule tried; the features used (decayed counts, recency, earlier-session counts, a random
+  projection of the current expert mix) do not reach it.
+- The engine sometimes ended without writing its `--eval` output (exit code 0, empty stdout, about a quarter of
+  runs on that machine); `main.cpp` now flushes explicitly. Why the process ends that way is not known.

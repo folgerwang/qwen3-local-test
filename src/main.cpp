@@ -367,6 +367,7 @@ int main(int argc, char** argv) {
             for (int i = 0; i < cfg.vocab; i++) idx[i] = i;
             std::partial_sort(idx.begin(), idx.begin() + 10, idx.end(), [&](int a, int b) { return logits[a] > logits[b]; });
             for (int i = 0; i < 10; i++) std::printf("%d %.4f\n", idx[i], logits[idx[i]]);
+            std::fflush(stdout);
             return 0;
         }
 
