@@ -54,11 +54,17 @@ F32 / F16 / BF16 / Q8_0 / Q4_K / Q5_K / Q6_K / Q5_1 / IQ4_NL; the Vulkan backend
 Q4_K, Q5_K, Q8_0 (gate/up) and additionally Q5_1 (down).
 
 For the GGUF model the Vulkan backend is built for a machine with much more RAM than VRAM: the dense weights
-(~5.5 GB) and a cache of the most used experts (6 GB by default; `--expert-cache MB`, 0 = none; raise it only if that much VRAM
-is really free, an overcommitted card is much slower) live in VRAM, and the
+(~5.5 GB) and a cache of the most used experts live in VRAM, and the
 CPU computes every other expert straight from the memory-mapped GGUF (72 GB of experts, so plan for ~96 GB of RAM or
 more). Each layer does one GPU round trip, so other programs using the GPU slow it down noticeably. `--threads N`
-sets the CPU threads for the experts (default: 3/8 of the hardware threads).
+sets the CPU threads for the experts (default: one per core).
+
+The expert cache takes the VRAM that is free on the card when the engine starts, less a 2 GB margin (on NVIDIA under
+Windows, where the driver reports what all programs use; elsewhere 6 GB). `--expert-cache MB` caps it, 0 = none. It
+never takes more than is free: an overcommitted card is much slower. Closing other programs that hold VRAM is the
+easiest way to make the model faster. The K/V caches of the attention layers start at 16,384 tokens and double as
+the conversation grows, so the 256K context limit costs no VRAM until it is used; when they grow, the VRAM comes out
+of the expert cache.
 
 Speculative decoding: with the model's MTP draft head (`mtp-*.gguf` one directory above the shards, where setup puts
 it) the Vulkan backend drafts up to 3 tokens per pass (`--draft N`, 0 = off) and verifies them together. A drafted

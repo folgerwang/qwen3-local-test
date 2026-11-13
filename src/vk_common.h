@@ -14,6 +14,8 @@
 
 #include "shaders_spv.h"
 
+uint64_t qw_system_free_vram(const char* device_name);  // vram_query.cpp: over all processes, 0 = unknown
+
 #define VK_CHECK(x)                                                                                     \
     do {                                                                                                \
         VkResult r_ = (x);                                                                              \
@@ -30,7 +32,7 @@ enum class Mem { Device, HostUpload, HostRead };
 struct Buf {
     VkBuffer buf = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
-    VkDeviceSize size = 0;
+    VkDeviceSize size = 0, alloc = 0;  // alloc: device memory behind it (0 for host-visible buffers)
     uint64_t addr = 0;
     uint8_t* map = nullptr;
 };
@@ -223,6 +225,7 @@ public:
     }
 
     const char* device_name() const { return props_.deviceName; }
+    VkDeviceSize allocated_device() const { return allocated_device_; }
 
     // Free device-local memory we may still allocate (budget - usage), or heap size if unknown.
     VkDeviceSize device_free() const {
@@ -269,12 +272,13 @@ public:
         ai.buffer = b->buf;
         b->addr = vkGetBufferDeviceAddress(dev_, &ai);
         if (kind != Mem::Device) VK_CHECK(vkMapMemory(dev_, b->mem, 0, VK_WHOLE_SIZE, 0, (void**)&b->map));
-        else allocated_device_ += req.size;
+        else allocated_device_ += b->alloc = req.size;
         bufs_.push_back(b);
         return b;
     }
 
     void destroy(Buf* b) {
+        allocated_device_ -= b->alloc;
         vkDestroyBuffer(dev_, b->buf, nullptr);
         vkFreeMemory(dev_, b->mem, nullptr);
         bufs_.erase(std::find(bufs_.begin(), bufs_.end(), b));

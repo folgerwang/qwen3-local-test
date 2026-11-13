@@ -121,7 +121,7 @@ if(QW_VULKAN)
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/gen
         COMMAND ${CMAKE_COMMAND} -DOUT=${CMAKE_BINARY_DIR}/gen/shaders_spv.h -DLIST=${CMAKE_BINARY_DIR}/spv_list.txt -P ${CMAKE_SOURCE_DIR}/cmake/embed_spv.cmake
         DEPENDS ${spv_files} ${CMAKE_SOURCE_DIR}/cmake/embed_spv.cmake VERBATIM)
-    target_sources(qwen PRIVATE src/vk_backend.cpp src/qwen4_vk.cpp ${CMAKE_BINARY_DIR}/gen/shaders_spv.h)
+    target_sources(qwen PRIVATE src/vk_backend.cpp src/qwen4_vk.cpp src/vram_query.cpp ${CMAKE_BINARY_DIR}/gen/shaders_spv.h)
     target_include_directories(qwen PRIVATE ${CMAKE_BINARY_DIR}/gen)
     target_compile_definitions(qwen PRIVATE QW_VULKAN=1)
     target_link_libraries(qwen PRIVATE Vulkan::Vulkan)

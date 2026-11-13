@@ -43,9 +43,12 @@ constexpr int EXPERT_GEMM_MIN = 33; // grouped experts use the tiled GEMM from t
 constexpr int ATT_PART_MAX = 2048;  // max (tokens x key splits) for split-K attention scratch
 constexpr int MAX_FILLS = 64;        // cache fills per forward pass (each is a CPU repack + upload)
 constexpr uint32_t FILL_MARGIN = 2; // session uses an expert needs over the cached one it replaces
-// Default VRAM budget for cached experts. Deliberately modest: the free-VRAM figure Vulkan reports does not
-// account for what other programs hold, and an overcommitted card is far slower than a small cache.
+// VRAM budget for cached experts when the driver cannot say how much VRAM is really free (see vram_query.cpp).
+// Deliberately modest: the free-VRAM figure Vulkan reports does not account for what other programs hold, and
+// an overcommitted card is far slower than a small cache. With a real figure the cache takes all free VRAM.
 constexpr VkDeviceSize AUTO_CACHE = 6ull << 30;
+constexpr int KV_START = 16384;      // tokens the K/V caches start with
+constexpr VkDeviceSize VRAM_MARGIN = 2048ull << 20;  // left free for the driver, the display and other programs
 constexpr float DRAFT_P_MIN = 0.5f; // stop drafting when the draft head's best token is less likely than this
 
 // Push-constant layouts (must match the shaders, std430)
@@ -116,6 +119,7 @@ public:
             throw std::runtime_error("model dimensions not supported by the Vulkan shaders");
         // tokens the MTP head drafts per pass; with them a pass is draft_ + 1 tokens, one matvec chunk at most
         draft_ = w.has_mtp ? std::max(0, std::min(opt.draft, NT - 1)) : 0;
+        sys_free0_ = qw_system_free_vram(gpu_.device_name());  // before our buffers: Windows only counts them once used
         upload_weights();
         alloc_state();
         setup_experts();
@@ -280,6 +284,8 @@ private:
     const Q4Config& c_;
     const Q4Weights& w_;
     int max_ctx_;
+    VkDeviceSize sys_free0_ = 0, kv_bytes_ = 0;
+    int kv_cap_ = 0, n_kv_slots_ = 0;  // tokens the K/V caches hold now, full-attention layers in them
     VulkanOptions opt_;
     int pos_ = 0, saved_pos_ = 0;
     Gpu gpu_;
@@ -520,7 +526,13 @@ private:
             ppad_ = act((size_t)(NMAX + ple_hist_) * HC);
         }
         // the K/V caches hold half floats (the kv16 shader variants), which is what makes a 256K context fit
-        const VkDeviceSize kv = (VkDeviceSize)n_full * max_ctx_ * c_.n_kv_heads * c_.head_dim * 2;
+        // They cover kv_cap_ tokens and grow with the conversation (ensure_kv), so the context limit costs no
+        // VRAM until it is used.
+        n_kv_slots_ = n_full;
+        const char* ks = std::getenv("QW_KV_START");  // tests force growth with a small start
+        kv_cap_ = std::min(max_ctx_, ks ? std::max(1, std::atoi(ks)) : KV_START);
+        const VkDeviceSize kv = (VkDeviceSize)n_full * kv_cap_ * c_.n_kv_heads * c_.head_dim * 2;
+        kv_bytes_ = 2 * kv;
         kcache_ = gpu_.create(std::max<VkDeviceSize>(kv, 256), Mem::Device);
         vcache_ = gpu_.create(std::max<VkDeviceSize>(kv, 256), Mem::Device);
         const VkDeviceSize cs = std::max<VkDeviceSize>((VkDeviceSize)n_lin * (c_.conv_kernel - 1) * c_.conv_dim() * 4, 256);
@@ -581,6 +593,60 @@ private:
         }
     }
 
+    // VRAM we may still take: what was free on the card at start (over all processes, when the driver can tell)
+    // less our own buffers and a margin. Windows only counts a buffer once it is used, hence the bookkeeping.
+    VkDeviceSize vram_left() const {
+        const VkDeviceSize own = gpu_.allocated_device();
+        VkDeviceSize free = gpu_.device_free();
+        if (sys_free0_) free = std::min<VkDeviceSize>(free, sys_free0_ > own ? sys_free0_ - own : 0);
+        return free > VRAM_MARGIN ? free - VRAM_MARGIN : 0;
+    }
+
+    // Gives one buffer of expert slots back (of the class with the most slots). False when the cache is empty.
+    bool release_expert_chunk() {
+        size_t k = 0;
+        for (size_t i = 1; i < slots_.size(); i++)
+            if (slots_[i].size() > slots_[k].size()) k = i;
+        if (slots_.empty() || slots_[k].empty()) return false;
+        Buf* b = slots_[k].back().buf;
+        while (!slots_[k].empty() && slots_[k].back().buf == b) {
+            if (slots_[k].back().key >= 0) where_[slots_[k].back().key] = {-1, -1};
+            slots_[k].pop_back();
+        }
+        gpu_.destroy(b);
+        return true;
+    }
+
+    // Grows the K/V caches to hold `tokens` positions (doubling, up to the context limit). The VRAM comes out
+    // of the expert cache when the card has none left. Call between passes: nothing may be recorded or running.
+    void ensure_kv(int tokens) {
+        if (tokens <= kv_cap_) return;
+        const int cap = (int)std::min<int64_t>(max_ctx_, std::max<int64_t>(2ll * kv_cap_, tokens));
+        const VkDeviceSize per = (VkDeviceSize)c_.n_kv_heads * c_.head_dim * 2;
+        const VkDeviceSize size = (VkDeviceSize)n_kv_slots_ * cap * per;
+        Buf* nb[2] = {nullptr, nullptr};
+        for (Buf*& b : nb) {
+            while (vram_left() < size && release_expert_chunk()) {}
+            while (!(b = gpu_.create(size, Mem::Device, true)))
+                if (!release_expert_chunk()) throw std::runtime_error("out of VRAM growing the K/V caches");
+        }
+        gpu_.begin();
+        for (int s = 0; s < n_kv_slots_; s++) {
+            gpu_.copy(kcache_, (VkDeviceSize)s * kv_cap_ * per, nb[0], (VkDeviceSize)s * cap * per, (VkDeviceSize)kv_cap_ * per);
+            gpu_.copy(vcache_, (VkDeviceSize)s * kv_cap_ * per, nb[1], (VkDeviceSize)s * cap * per, (VkDeviceSize)kv_cap_ * per);
+        }
+        gpu_.submit_wait();
+        gpu_.destroy(kcache_);
+        gpu_.destroy(vcache_);
+        kcache_ = nb[0];
+        vcache_ = nb[1];
+        kv_cap_ = cap;
+        size_t n_slots = 0;
+        for (auto& s : slots_) n_slots += s.size();
+        std::fprintf(stderr, "[vulkan] K/V caches grown to %d tokens (%.1f GB); %zu expert slots cached\n", cap,
+                     2 * size / 1073741824.0, n_slots);
+    }
+
     void setup_experts() {
         // per-layer slot layout: [gate][up][down], Q8_0 parts as planar weights followed by their scales
         for (int l = 0; l < (int)L_.size(); l++) {
@@ -618,9 +684,14 @@ private:
         // VRAM cache: the budget is split between the slot-size classes in proportion to their experts' bytes.
         // It never takes VRAM that is not free right now: an overcommitted card makes Windows move buffers
         // to system memory, which slows every shader down.
-        const VkDeviceSize free = gpu_.device_free(), margin = 2048ull << 20;  // driver / display headroom
-        VkDeviceSize budget = opt_.expert_cache_set ? (VkDeviceSize)opt_.expert_cache_mb << 20 : AUTO_CACHE;
-        budget = std::min(budget, free > margin ? free - margin : 0);
+        const VkDeviceSize own = gpu_.allocated_device(), left = vram_left();
+        VkDeviceSize budget = opt_.expert_cache_set ? (VkDeviceSize)opt_.expert_cache_mb << 20 : sys_free0_ ? ~0ull : AUTO_CACHE;
+        budget = std::min(budget, left);
+        if (sys_free0_)
+            std::fprintf(stderr, "[vulkan] VRAM: %.1f GB free at start, %.1f GB dense weights and state, %.1f GB K/V caches "
+                                 "for the first %d tokens of context, %.1f GB left for experts\n",
+                         sys_free0_ / 1073741824.0, (own - kv_bytes_) / 1073741824.0, kv_bytes_ / 1073741824.0, kv_cap_,
+                         left / 1073741824.0);
         const size_t nc = cls_size_.size();
         std::vector<size_t> cls_keys(nc, 0);
         VkDeviceSize total = 0;
@@ -824,7 +895,7 @@ private:
     void attention(int l, int n, int pos, std::vector<int>& deferred) {
         const GLayer& g = L_[l];
         const int H = c_.hidden, AD = c_.n_heads * c_.head_dim;
-        const VkDeviceSize kv = (VkDeviceSize)slot_[l] * max_ctx_ * c_.n_kv_heads * c_.head_dim * 2;
+        const VkDeviceSize kv = (VkDeviceSize)slot_[l] * kv_cap_ * c_.n_kv_heads * c_.head_dim * 2;
         bool masked = false;
         if (qsa_slot_[l] >= 0) {
             const VkDeviceSize ho = (VkDeviceSize)qsa_slot_[l] * NMAX * H * 4;
@@ -1017,6 +1088,7 @@ private:
     // One trunk pass over n tokens. logits: of the last token, or with `spec` (a speculative pass of at most
     // draft_ + 1 tokens, see forward_all) of every token, with per-token snapshots of the recurrent state.
     void forward_chunk(const int* tokens, int n, float* logits, bool spec) {
+        ensure_kv(pos_ + n);
         const int H = c_.hidden, HC = c_.hc_dim();
         float* hx = (float*)hx_->map;
         for (int t = 0; t < n; t++) toks_[pos_ + t] = tokens[t];
@@ -1078,6 +1150,7 @@ private:
     // last trunk pass (x_); otherwise (a further draft step, n == 1) the block's own previous output. commit:
     // row n-1 of the trunk pass becomes the new pending row. logits: of the last row (the token after toks[n-1]).
     void mtp_run(const int* toks, int n, int p0, float* logits, bool from_trunk, bool commit) {
+        ensure_kv(std::min(max_ctx_, p0 + n + 1));
         const int H = c_.hidden, HC = c_.hc_dim(), l = c_.n_layers;
         const GLayer& g = L_[l];
         float* he = (float*)hme_->map;
