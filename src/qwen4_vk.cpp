@@ -519,7 +519,8 @@ private:
             pgated_ = act((size_t)NMAX * HC);
             ppad_ = act((size_t)(NMAX + ple_hist_) * HC);
         }
-        const VkDeviceSize kv = (VkDeviceSize)n_full * max_ctx_ * c_.n_kv_heads * c_.head_dim * 4;
+        // the K/V caches hold half floats (the kv16 shader variants), which is what makes a 256K context fit
+        const VkDeviceSize kv = (VkDeviceSize)n_full * max_ctx_ * c_.n_kv_heads * c_.head_dim * 2;
         kcache_ = gpu_.create(std::max<VkDeviceSize>(kv, 256), Mem::Device);
         vcache_ = gpu_.create(std::max<VkDeviceSize>(kv, 256), Mem::Device);
         const VkDeviceSize cs = std::max<VkDeviceSize>((VkDeviceSize)n_lin * (c_.conv_kernel - 1) * c_.conv_dim() * 4, 256);
@@ -823,7 +824,7 @@ private:
     void attention(int l, int n, int pos, std::vector<int>& deferred) {
         const GLayer& g = L_[l];
         const int H = c_.hidden, AD = c_.n_heads * c_.head_dim;
-        const VkDeviceSize kv = (VkDeviceSize)slot_[l] * max_ctx_ * c_.n_kv_heads * c_.head_dim * 4;
+        const VkDeviceSize kv = (VkDeviceSize)slot_[l] * max_ctx_ * c_.n_kv_heads * c_.head_dim * 2;
         bool masked = false;
         if (qsa_slot_[l] >= 0) {
             const VkDeviceSize ho = (VkDeviceSize)qsa_slot_[l] * NMAX * H * 4;
@@ -855,7 +856,7 @@ private:
         PcQkRope pr{qg_.addr(), kb_.addr(), vb_.addr(), qo_.addr(), kcache_->addr + kv, vcache_->addr + kv,
                     g.qn.addr(), g.kn.addr(), rope_.addr(), (uint32_t)pos, (uint32_t)c_.n_heads,
                     (uint32_t)c_.n_kv_heads, (uint32_t)c_.rope_dim, c_.rms_eps};
-        gpu_.dispatch("qk_norm_rope", pr, n, c_.n_heads + c_.n_kv_heads);
+        gpu_.dispatch("qk_norm_rope_kv16", pr, n, c_.n_heads + c_.n_kv_heads);
         gpu_.barrier();
         // split-K over keys: many splits when few tokens (decode), few when the batch is already wide
         const int maxlen = pos + n;
@@ -867,11 +868,11 @@ private:
             PcAttnQsa pa{qo_.addr(), kcache_->addr + kv, vcache_->addr + kv, part_.addr(), (uint32_t)pos, (uint32_t)c_.n_heads,
                          (uint32_t)c_.n_kv_heads, (uint32_t)chunk, (uint32_t)splits, scale, hmask_->addr,
                          (uint32_t)w_.layers[l].compress, (uint32_t)mask_words_};
-            gpu_.dispatch("attention_qsa", pa, n, c_.n_heads, splits);
+            gpu_.dispatch("attention_qsa_kv16", pa, n, c_.n_heads, splits);
         } else {
             PcAttn pa{qo_.addr(), kcache_->addr + kv, vcache_->addr + kv, part_.addr(), (uint32_t)pos, (uint32_t)c_.n_heads,
                       (uint32_t)c_.n_kv_heads, (uint32_t)chunk, (uint32_t)splits, scale};
-            gpu_.dispatch("attention", pa, n, c_.n_heads, splits);
+            gpu_.dispatch("attention_kv16", pa, n, c_.n_heads, splits);
         }
         gpu_.barrier();
         PcAttnCombine pc{part_.addr(), qg_.addr(), att_.addr(), (uint32_t)c_.n_heads, (uint32_t)splits};

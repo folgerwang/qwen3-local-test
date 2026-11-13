@@ -1,6 +1,7 @@
 // Split-K causal GQA attention, head_dim 256. Workgroup = (token, head, key split). 8 subgroups each
 // stream a strided subset of the split's keys with an online softmax (lanes hold 8 dims each); the
 // workgroup then merges them and writes an unnormalized partial (max m, sum l, o[256]) for attn_combine.
+// KV16: the K/V caches hold half floats (a uvec4 = one lane's 8 dims).
 // QSA: token t only attends to the blocks of `cr` keys whose bit is set in mask[t][mask_words] and to the
 // incomplete tail block (keys from (len / cr) * cr on).
 #version 460
@@ -40,13 +41,21 @@ void main() {
         const uint blk = j / pc.cr;
         if (j < tail && (mask.v[blk >> 5] & (1u << (blk & 31u))) == 0u) continue;
 #endif
+#ifdef KV16
+        const uint64_t off = uint64_t(j * pc.n_kv + kvh) * (D * 2u);
+        const uvec4 kw = U4(pc.kcache + off).v[lane], vw = U4(pc.vcache + off).v[lane];
+        const vec4 ka = vec4(unpackHalf2x16(kw.x), unpackHalf2x16(kw.y)), kb = vec4(unpackHalf2x16(kw.z), unpackHalf2x16(kw.w));
+        const vec4 va = vec4(unpackHalf2x16(vw.x), unpackHalf2x16(vw.y)), vb = vec4(unpackHalf2x16(vw.z), unpackHalf2x16(vw.w));
+#else
         const uint64_t off = uint64_t((j * pc.n_kv + kvh) * D) * 4u;
         F4 k4 = F4(pc.kcache + off), v4 = F4(pc.vcache + off);
-        const float s = subgroupAdd(dot(qa, k4.v[lane * 2u]) + dot(qb, k4.v[lane * 2u + 1u]));
+        const vec4 ka = k4.v[lane * 2u], kb = k4.v[lane * 2u + 1u], va = v4.v[lane * 2u], vb = v4.v[lane * 2u + 1u];
+#endif
+        const float s = subgroupAdd(dot(qa, ka) + dot(qb, kb));
         const float mn = max(m, s), corr = exp(m - mn), p = exp(s - mn);
         l = l * corr + p;
-        oa = oa * corr + p * v4.v[lane * 2u];
-        ob = ob * corr + p * v4.v[lane * 2u + 1u];
+        oa = oa * corr + p * va;
+        ob = ob * corr + p * vb;
         m = mn;
     }
     if (lane == 0u) { sm[sg] = m; sl[sg] = l; }

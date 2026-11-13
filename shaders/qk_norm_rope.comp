@@ -1,6 +1,7 @@
 // Per (token, head): rmsnorm(1+w) over head_dim 256, then partial RoPE on the first rope_dim dims.
 // Query heads (y < n_heads) read from the interleaved [query|gate] projection and write to q.
 // Key heads write the K cache at position pos+t and also copy V into the V cache.
+// KV16: both caches hold half floats, two per uint, so the even threads write the pairs.
 #version 460
 #include "common.glsl"
 
@@ -13,6 +14,9 @@ layout(push_constant) uniform PC {
 } pc;
 
 shared float sh[D];
+#ifdef KV16
+shared float sk[D];
+#endif
 shared float red[8];
 
 void main() {
@@ -36,6 +40,17 @@ void main() {
         const float c = rp.v[2u * i], s = rp.v[2u * i + 1u];
         y = d < half_ ? sh[d] * c - sh[d + half_] * s : sh[d] * c + sh[i] * s;
     }
+#ifdef KV16
+    sk[d] = y;
+    barrier();
+    if (is_q) {
+        F32(pc.q_out).v[(t * pc.n_heads + h) * D + d] = y;
+    } else if ((d & 1u) == 0u) {
+        const uint ci = ((p * pc.n_kv + h) * D + d) / 2u, vi = (t * pc.n_kv + h) * D + d;
+        U32W(pc.kcache).v[ci] = packHalf2x16(vec2(y, sk[d + 1u]));
+        U32W(pc.vcache).v[ci] = packHalf2x16(vec2(F32(pc.v).v[vi], F32(pc.v).v[vi + 1u]));
+    }
+#else
     if (is_q) {
         F32(pc.q_out).v[(t * pc.n_heads + h) * D + d] = y;
     } else {
@@ -43,4 +58,5 @@ void main() {
         F32(pc.kcache).v[ci] = y;
         F32(pc.vcache).v[ci] = F32(pc.v).v[(t * pc.n_kv + h) * D + d];
     }
+#endif
 }

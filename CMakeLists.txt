@@ -95,7 +95,9 @@ if(QW_VULKAN)
         "conv1d_snap|conv1d.comp|-DSNAP"
         "q4_hc_cat|q4_hc.comp|-DHC_CAT"
         "moe_combine_set|moe_combine.comp|-DASSIGN"
-        "attention_qsa|attention.comp|-DQSA")
+        "qk_norm_rope_kv16|qk_norm_rope.comp|-DKV16"
+        "attention_kv16|attention.comp|-DKV16"
+        "attention_qsa_kv16|attention.comp|-DQSA -DKV16")
     set(spv_files "")
     set(spv_args "")
     file(GLOB shader_deps ${CMAKE_SOURCE_DIR}/shaders/*)
