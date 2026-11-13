@@ -7,5 +7,5 @@ cd /d "%~dp0"
 set BACKEND=%1
 if "%BACKEND%"=="" set BACKEND=vulkan
 title Qwen3.8-Flash-Next UD-Q4_K_XL (%BACKEND%)
-build\Release\qwen.exe --backend %BACKEND% --ctx 32768 --hide-think %2 %3 %4 %5 %6 %7 %8 %9
+build\Release\qwen.exe --backend %BACKEND% --hide-think %2 %3 %4 %5 %6 %7 %8 %9
 pause

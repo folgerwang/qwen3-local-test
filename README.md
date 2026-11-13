@@ -6,6 +6,25 @@ From-scratch C++ inference engine for Qwen MoE models (CPU AVX-512 + hand-writte
   in place: Q4_K / Q5_K / Q5_1 / Q8_0 / IQ4_NL blocks are decoded on the fly by the CPU kernels and the shaders.
 - Qwen3.5 / 3.6 MoE models from FP8 safetensors.
 
+## SiCode
+
+A terminal coding assistant built on this engine: requests run on the local Qwen3.8-Flash-Next, and a request that
+starts with `[c]` is planned and reviewed by Claude over the Claude API while the local model does the work.
+
+**Download:** [sicode-0.1.0-py3-none-any.whl](https://github.com/folgerwang/qwen3-local-test/releases/download/sicode-v0.1.0/sicode-0.1.0-py3-none-any.whl)
+([all releases](https://github.com/folgerwang/qwen3-local-test/releases))
+
+```
+pip install sicode-0.1.0-py3-none-any.whl
+set SICODE_ENGINE=<this repo>\build\Release\qwen.exe
+set SICODE_MODEL=<this repo>\models\Qwen3.8-Flash-Next-GGUF\UD-Q4_K_XL
+cd your-project
+python -m sicode
+```
+
+From a checkout of this repository, `pip install -e .` needs no paths. The wheel holds only the assistant; the engine
+and the model come from the Setup section below. Details: [sicode/README.md](sicode/README.md).
+
 ## Setup
 
 Requires Visual Studio 2022, CMake ≥ 3.20, the Vulkan SDK and Python 3.

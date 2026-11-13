@@ -1,0 +1,22 @@
+# The SiCode package (the terminal coding assistant in sicode/). The engine itself is built with CMake;
+# setup.py in this directory is the model downloader, not a packaging script, hence the hatchling backend.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sicode"
+version = "0.1.0"
+description = "Terminal coding assistant: Claude plans and reviews, a local Qwen3.8-Flash-Next does the work"
+readme = "sicode/README.md"
+requires-python = ">=3.10"
+dependencies = ["anthropic>=2.8"]
+
+[project.scripts]
+sicode = "sicode.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sicode"]
+
+[tool.hatch.build.targets.sdist]
+include = ["sicode", "pyproject.toml"]

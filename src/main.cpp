@@ -39,7 +39,7 @@ struct Options {
     std::string tokenize_file;
     std::string eval_ids;
     int eval_split = 0;
-    int max_ctx = 32768;
+    int max_ctx = 0;  // 0 = the model's default: 262144 for the GGUF model, 32768 for FP8
     int max_new = 4096;
     int threads = 0;
     size_t expert_cache_mb = 0;  // 0 = auto
@@ -57,6 +57,7 @@ struct Options {
     std::string mtp_path;
     bool hide_think = false;
     bool no_stats = false;
+    bool pipe = false;
 };
 
 void usage() {
@@ -74,13 +75,14 @@ void usage() {
         "  --drop-think         drop it (default: what the model's chat template does: keep for\n"
         "                       Qwen3.8-Flash-Next, drop for Qwen3.5/3.6)\n"
         "  -n N                 max new tokens per reply (default 4096)\n"
-        "  --ctx N              context length (default 32768)\n"
+        "  --ctx N              context length (default 262144 for the GGUF model, 32768 for FP8)\n"
         "  --temp T --top-k K --top-p P --seed S --greedy\n"
         "  --threads N          CPU threads (default: all)\n"
         "  --expert-cache MB    GPU expert cache size (vulkan, default: auto)\n"
         "  --draft N            tokens drafted per pass by the MTP draft head (GGUF model on vulkan, default 3,\n"
         "                       0 = off); needs mtp-*.gguf next to or one directory above the model\n"
         "  --mtp FILE           the draft head GGUF, if it is somewhere else\n"
+        "  --pipe               serve chat turns over stdin/stdout, one JSON object per line (see sicode/README.md)\n"
         "  --tokenize TEXT      print token ids and exit\n"
         "  --eval IDS           comma-separated ids: run and print top-10 logits of last position\n");
 }
@@ -168,6 +170,29 @@ private:
     std::string pending_;
 };
 
+// A JSON string literal. Bytes >= 0x80 pass through (the text is UTF-8).
+std::string json_quote(const std::string& s) {
+    std::string r = "\"";
+    for (unsigned char c : s) {
+        if (c == '"') r += "\\\"";
+        else if (c == '\\') r += "\\\\";
+        else if (c == '\n') r += "\\n";
+        else if (c == '\r') r += "\\r";
+        else if (c == '\t') r += "\\t";
+        else if (c < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); r += b; }
+        else r += (char)c;
+    }
+    return r + "\"";
+}
+
+struct Turn {
+    std::string text;  // everything generated, reasoning included
+    int n_gen = 0;
+    size_t n_prefill = 0;
+    bool ended = false;  // the model closed its turn (false: token limit or context full)
+    double prefill_s = 0, gen_s = 0;
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -209,6 +234,7 @@ int main(int argc, char** argv) {
         else if (a == "--hybrid") o.hybrid = 1;
         else if (a == "--no-hybrid") o.hybrid = 0;
         else if (a == "--no-stats") o.no_stats = true;
+        else if (a == "--pipe") o.pipe = true;
         else if (a == "--tokenize") o.tokenize = next();
         else if (a == "--tokenize-file") o.tokenize_file = next();
         else if (a == "--eval") o.eval_ids = next();
@@ -279,7 +305,8 @@ int main(int argc, char** argv) {
                 }
             }
             cfg = {qcfg.vocab, qcfg.n_layers, gguf->count(), qcfg.eos_ids};
-            if (o.backend == "cpu") be = make_qwen4_cpu_backend(qcfg, qw, o.max_ctx, o.threads);
+            const int ctx = o.max_ctx ? o.max_ctx : 262144;
+            if (o.backend == "cpu") be = make_qwen4_cpu_backend(qcfg, qw, ctx, o.threads);
 #ifdef QW_VULKAN
             else if (o.backend == "vulkan" || o.backend == "vk") {
                 VulkanOptions vo;
@@ -290,7 +317,7 @@ int main(int argc, char** argv) {
                 vo.expert_cache_set = o.expert_cache_set;
                 vo.threads = o.threads;
                 vo.draft = o.draft;
-                be = make_qwen4_vulkan_backend(qcfg, qw, o.max_ctx, vo);
+                be = make_qwen4_vulkan_backend(qcfg, qw, ctx, vo);
             }
 #endif
             else throw std::runtime_error("unknown/unavailable backend: " + o.backend);
@@ -299,7 +326,8 @@ int main(int argc, char** argv) {
             st = std::make_unique<SafeTensors>(o.model_dir);
             fw.load(*st, fcfg);
             cfg = {fcfg.vocab, fcfg.n_layers, st->count(), fcfg.eos_ids};
-            if (o.backend == "cpu") be = make_cpu_backend(fcfg, fw, o.max_ctx, o.threads);
+            const int ctx = o.max_ctx ? o.max_ctx : 32768;
+            if (o.backend == "cpu") be = make_cpu_backend(fcfg, fw, ctx, o.threads);
 #ifdef QW_VULKAN
             else if (o.backend == "vulkan" || o.backend == "vk") {
                 VulkanOptions vo;
@@ -307,7 +335,7 @@ int main(int argc, char** argv) {
                 vo.stats_path = o.no_stats ? "" : state_dir + "/expert_usage.bin";
                 vo.pin_experts = !o.no_pin;
                 vo.hybrid = o.hybrid;
-                be = make_vulkan_backend(fcfg, fw, o.max_ctx, vo);
+                be = make_vulkan_backend(fcfg, fw, ctx, vo);
             }
 #endif
             else throw std::runtime_error("unknown/unavailable backend: " + o.backend);
@@ -344,7 +372,8 @@ int main(int argc, char** argv) {
         // One chat turn. The history is kept in the form the official chat template renders it: earlier
         // assistant turns appear without their <think> block. The recurrent state is snapshotted right after
         // "<|im_start|>assistant\n"; once the reply is done we roll back to it and feed only the final answer.
-        auto run_turn = [&](const std::string& msg, bool first) {
+        // `quiet` prints nothing to stdout (the pipe mode returns the text instead).
+        auto run_turn = [&](const std::string& msg, bool first, bool quiet = false) -> Turn {
             std::string head;
             if (first && !o.system.empty()) head += "<|im_start|>system\n" + o.system + "<|im_end|>\n";
             if (!first) head += "\n";  // newline after the previous <|im_end|>
@@ -360,8 +389,8 @@ int main(int argc, char** argv) {
             const size_t n_prefill = ids.size() + gen_prompt.size();
             double prefill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
             // With hide_think, reasoning is not printed: "thinking" gets a dot every 2 seconds until </think>.
-            bool hiding = o.think && o.hide_think;
-            if (o.think && !hiding) std::printf("<think>\n");
+            bool hiding = o.think && o.hide_think && !quiet;
+            if (o.think && !hiding && !quiet) std::printf("<think>\n");
             int dots = 0;
             bool skip_nl = false;
             auto last_dot = std::chrono::steady_clock::now();
@@ -378,6 +407,7 @@ int main(int argc, char** argv) {
             auto emit = [&](int id) {
                 const std::string piece = tok.decode(id);
                 text += piece;
+                if (quiet) return;
                 if (!hiding) {
                     if (skip_nl) {  // drop the newlines between </think> and the answer
                         const size_t b = piece.find_first_not_of('\n');
@@ -415,7 +445,7 @@ int main(int argc, char** argv) {
                 if (is_eos(next)) { ended = next == im_end; break; }
                 emit(next);
                 n_gen++;
-                if (be->pos() + 2 >= be->max_ctx()) { std::printf("\n[context full]"); break; }
+                if (be->pos() + 2 >= be->max_ctx()) { if (!quiet) std::printf("\n[context full]"); break; }
                 seq[0] = next;
                 const int room = std::min(o.max_new - n_gen, be->max_ctx() - be->pos() - 3);
                 auto td0 = std::chrono::steady_clock::now();
@@ -444,7 +474,7 @@ int main(int argc, char** argv) {
                 t_accept += std::chrono::duration<double>(std::chrono::steady_clock::now() - td2).count();
             }
             if (hiding) std::printf("\n[reasoning did not finish within %d tokens; raise -n]", o.max_new);
-            out.flush();
+            if (!quiet) out.flush();
             double gen_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tg).count();
 
             if (o.keep_think) {
@@ -467,10 +497,55 @@ int main(int argc, char** argv) {
             if (n_passes) std::fprintf(stderr, " | %d of %d tokens from accepted drafts, %d draft passes", n_drafted, n_gen, n_passes);
             if (n_passes && std::getenv("QW_PROFILE")) std::fprintf(stderr, " (draft %.2fs, verify %.2fs, accept %.2fs)", t_draft, t_verify, t_accept);
             std::fprintf(stderr, "]\n");
+            return {text, n_gen, n_prefill, ended, prefill_s, gen_s};
         };
 
         if (!o.prompt.empty()) {
             run_turn(o.prompt, true);
+            return 0;
+        }
+        if (o.pipe) {
+            // One request per stdin line, one reply per stdout line. {"op":"reset"} clears the conversation;
+            // {"user":TEXT, "system":TEXT, "max_tokens":N, "think":BOOL} appends a user turn and generates the
+            // reply (system only counts on the first turn after a reset).
+            std::printf("{\"ready\":true,\"ctx\":%d}\n", be->max_ctx());
+            std::fflush(stdout);
+            const Options base = o;
+            bool first = true;
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty()) continue;
+                std::string reply;
+                try {
+                    const json::Value req = json::parse(line);
+                    const json::Value* op = req.find("op");
+                    if (op && op->as_str() == "reset") {
+                        be->reset();
+                        first = true;
+                        reply = "{\"ok\":true}";
+                    } else {
+                        const json::Value* sys = req.find("system");
+                        const json::Value* th = req.find("think");
+                        o.system = sys ? sys->as_str() : base.system;
+                        o.think = th ? th->b : base.think;
+                        o.max_new = (int)req.get_int("max_tokens", base.max_new);
+                        const Turn t = run_turn(req["user"].as_str(), first, true);
+                        first = false;
+                        char num[256];
+                        std::snprintf(num, sizeof num, ",\"finished\":%s,\"gen_tokens\":%d,\"prefill_tokens\":%zu,"
+                                      "\"gen_tps\":%.2f,\"prefill_tps\":%.1f,\"ctx_used\":%d,\"ctx\":%d}",
+                                      t.ended ? "true" : "false", t.n_gen, t.n_prefill, t.n_gen / std::max(t.gen_s, 1e-9),
+                                      t.n_prefill / std::max(t.prefill_s, 1e-9), be->pos(), be->max_ctx());
+                        reply = "{\"text\":" + json_quote(t.text) + num;
+                    }
+                } catch (const std::exception& e) {
+                    reply = "{\"error\":" + json_quote(e.what()) + "}";
+                }
+                std::fwrite(reply.data(), 1, reply.size(), stdout);
+                std::fputc('\n', stdout);
+                std::fflush(stdout);
+            }
             return 0;
         }
         std::printf("Interactive chat. Commands: /reset, /think (show/hide reasoning), /exit\n");
