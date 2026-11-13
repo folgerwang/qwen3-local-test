@@ -42,17 +42,57 @@ Each request says who takes it:
 | `[l] task` | the local model alone |
 | `task` (no prefix) | the local model alone |
 
-Only `[c]` requests use the Claude API, so `ANTHROPIC_API_KEY` is needed for those alone. The two sides keep
+Only `[c]` requests use the Claude API. If no key is set, SiCode asks for one when it starts (typed hidden; Enter
+skips it) and saves it in `~/.sicode/config.json` for later runs; `/key` asks again, and `ANTHROPIC_API_KEY` in the
+environment takes precedence over the saved key. The two sides keep
 separate conversations: consecutive local requests continue one conversation, `[c]` requests continue Claude's,
 and neither sees the other's. A `[c]` request that delegates work starts the local conversation afresh.
 
-Options: `--yes` runs shell commands without asking (default: ask each time, `a` = always), `--dir PATH` sets the
-workspace, `--model` and `--effort` choose the Claude model and its effort (default `claude-opus-5-5`, `high`),
-`--worker-effort low|medium|xhigh` sets the worker's reasoning effort, `--exe` and `--worker-model` override the
-engine and model paths.
+### In a session
 
-All file tools are confined to the workspace. Shell commands run in the workspace root but are otherwise not
-sandboxed.
+Replies are printed as they are written, each tool call is shown as it runs, and each file change is shown as a
+diff. Ctrl+C stops the current reply and keeps the conversation.
+
+| Input | What it does |
+|---|---|
+| `@path` in a request | attaches that file's content |
+| `!command` | runs a shell command yourself, outside any model |
+| a line ending in `\` | continues on the next line |
+| `/help` | lists everything here |
+| `/clear` | starts new conversations (local and Claude) |
+| `/compact` | replaces the local conversation by its summary, to free context |
+| `/context` | context use, tokens spent, mode, models |
+| `/diff` | git diff of the workspace |
+| `/undo` | puts back the files changed by the last request |
+| `/init` | has the local model write `SICODE.md` |
+| `/mode [ask\|edits\|auto]` | shows or sets the permission mode |
+| `/model [name]` | Claude model for `[c]`: `opus`, `sonnet`, `haiku`, `fable` or a full id |
+| `/think` | shows or hides the local model's reasoning |
+| `/key` | sets the Claude API key |
+
+### Permissions
+
+| Mode | File changes | Shell commands |
+|---|---|---|
+| `ask` (default) | asks, after showing the diff | asks |
+| `edits` | applied | asks |
+| `auto` (`--yes`) | applied | run |
+
+Answering `a` to a file change switches to `edits`; answering `a` to a command allows every command that starts
+with the same word for the rest of the session. All file tools are confined to the workspace. Shell commands run in
+the workspace root but are otherwise not sandboxed. With `-p` and no terminal, nothing can be asked, so use
+`--mode auto` (or `edits`) there.
+
+### Project notes
+
+`SICODE.md` at the workspace root (or, failing that, `CLAUDE.md` or `AGENTS.md`) is loaded into every conversation,
+local and Claude. `/init` writes it.
+
+### Options
+
+`--mode`, `--dir PATH` (the workspace), `--model` and `--effort` (the Claude model and its effort, default
+`claude-opus-5-5`, `high`), `--worker-effort low|medium|xhigh` (the local model's reasoning effort), `--exe` and
+`--worker-model` (the engine and model paths).
 
 ## Modules
 
@@ -67,8 +107,10 @@ sandboxed.
 It prints `{"ready":true,"ctx":N}` once the model is loaded.
 
 - `{"op":"reset"}` clears the conversation. Reply: `{"ok":true}`.
-- `{"user":TEXT, "system":TEXT, "max_tokens":N, "think":BOOL}` appends a user turn and generates the reply.
-  `system` only counts on the first turn after a reset. Reply: `{"text":..., "finished":BOOL, "gen_tokens":N,
+- `{"user":TEXT, "system":TEXT, "max_tokens":N, "think":BOOL, "stream":BOOL, "interrupt_file":PATH}` appends a
+  user turn and generates the reply. `system` only counts on the first turn after a reset. With `stream`,
+  `{"delta":TEXT}` lines come first, as the reply is written. Generation stops early once the file named by
+  `interrupt_file` exists. Reply: `{"text":..., "finished":BOOL, "interrupted":BOOL, "gen_tokens":N,
   "prefill_tokens":N, "gen_tps":X, "prefill_tps":X, "ctx_used":N, "ctx":N}`. `text` includes the reasoning, up to
   `</think>`; `finished` is false when the reply hit `max_tokens` or the context is full.
 

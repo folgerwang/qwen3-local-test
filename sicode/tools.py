@@ -1,4 +1,4 @@
-"""File and shell tools shared by the architect (Claude) and the local worker. Every path is confined to the workspace."""
+"""File and shell tools shared by Claude and the local model. Every path is confined to the workspace."""
 import fnmatch
 import os
 import re
@@ -16,12 +16,22 @@ def clip(text, limit=MAX_OUT):
 
 
 class Workspace:
-    """`approve(command) -> bool` is asked before each shell command; `changed` collects the files written."""
+    """The project directory and the tools that act on it.
 
-    def __init__(self, root, approve):
+    approve_command(command) -> bool and approve_edit(path, old, new) -> bool are asked before a shell command
+    runs and before a file changes (old is None for a new file). show_plan(text) displays the task list.
+    """
+
+    def __init__(self, root, approve_command, approve_edit=lambda path, old, new: True, show_plan=lambda text: None):
         self.root = os.path.realpath(root)
-        self.approve = approve
-        self.changed = set()
+        self.approve_command = approve_command
+        self.approve_edit = approve_edit
+        self.show_plan = show_plan
+        self.changed = set()   # files written since the caller last cleared it
+        self.backups = {}      # path -> content before the first change since begin_turn() (None: did not exist)
+
+    def begin_turn(self):
+        self.backups = {}
 
     def path(self, rel):
         p = os.path.realpath(os.path.join(self.root, rel))
@@ -38,6 +48,30 @@ class Workspace:
             for f in sorted(files):
                 yield os.path.join(d, f)
 
+    def _store(self, p, old, new):
+        """Writes `new` to p after asking; returns None, or the error text for the model."""
+        r = self.rel(p)
+        if not self.approve_edit(r, old, new):
+            return "error: the user declined this change"
+        self.backups.setdefault(r, old)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            f.write(new)
+        self.changed.add(r)
+        return None
+
+    def restore(self, backups):
+        """Puts files back to the contents in `backups` (None deletes the file). Returns the paths restored."""
+        for r, old in backups.items():
+            p = self.path(r)
+            if old is None:
+                if os.path.exists(p):
+                    os.remove(p)
+            else:
+                with open(p, "w", encoding="utf-8", newline="") as f:
+                    f.write(old)
+        return sorted(backups)
+
     # --- tools: each returns the text shown to the model ---
 
     def read_file(self, path, offset=1, limit=400):
@@ -52,29 +86,25 @@ class Workspace:
 
     def write_file(self, path, content):
         p = self.path(path)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w", encoding="utf-8", newline="") as f:
-            f.write(content)
-        self.changed.add(self.rel(p))
-        return f"wrote {self.rel(p)} ({content.count(chr(10)) + 1} lines)"
+        old = None
+        if os.path.exists(p):
+            with open(p, encoding="utf-8", errors="replace", newline="") as f:
+                old = f.read()
+        return self._store(p, old, content) or f"wrote {self.rel(p)} ({content.count(chr(10)) + 1} lines)"
 
     def edit_file(self, path, old_text, new_text):
         p = self.path(path)
         with open(p, encoding="utf-8", newline="") as f:
-            text = f.read()
-        crlf = "\r\n" in text
-        if crlf:
-            text = text.replace("\r\n", "\n")
+            old = f.read()
+        crlf = "\r\n" in old
+        text = old.replace("\r\n", "\n") if crlf else old
         n = text.count(old_text)
         if n == 0:
             return "error: old_text was not found in the file (it must match exactly, including indentation)"
         if n > 1:
             return f"error: old_text occurs {n} times; include more surrounding lines so it is unique"
         text = text.replace(old_text, new_text)
-        with open(p, "w", encoding="utf-8", newline="") as f:
-            f.write(text.replace("\n", "\r\n") if crlf else text)
-        self.changed.add(self.rel(p))
-        return f"edited {self.rel(p)}"
+        return self._store(p, old, text.replace("\n", "\r\n") if crlf else text) or f"edited {self.rel(p)}"
 
     def list_files(self, pattern="*"):
         hits = [r for r in (self.rel(p) for p in self.walk())
@@ -104,7 +134,7 @@ class Workspace:
         return clip("\n".join(out)) if out else "no matches"
 
     def run_command(self, command, timeout=300):
-        if not self.approve(command):
+        if not self.approve_command(command):
             return "error: the user declined to run this command"
         try:
             r = subprocess.run(command, shell=True, cwd=self.root, capture_output=True, timeout=int(timeout),
@@ -113,9 +143,14 @@ class Workspace:
             return f"error: the command did not finish within {timeout} s"
         return clip(f"exit code {r.returncode}\n{r.stdout}{r.stderr}".rstrip())
 
+    def update_plan(self, plan):
+        self.show_plan(plan)
+        return "plan updated"
+
     def call(self, name, args):
         fn = {"read_file": self.read_file, "write_file": self.write_file, "edit_file": self.edit_file,
-              "list_files": self.list_files, "search": self.search, "run_command": self.run_command}.get(name)
+              "list_files": self.list_files, "search": self.search, "run_command": self.run_command,
+              "update_plan": self.update_plan}.get(name)
         if fn is None:
             return f"error: unknown tool {name}"
         try:
@@ -149,4 +184,8 @@ TOOLS = [
     _tool("run_command", "Run a shell command in the workspace root (Windows cmd) and return its exit code and output. "
           "Use it to build and to run tests.",
           {"command": S, "timeout": {**I, "description": "Seconds. Default 300."}}, ["command"]),
+    _tool("update_plan", "Show the user your task list for a job with several steps, and update it as steps finish. "
+          "Send the whole list each time.",
+          {"plan": {**S, "description": "One step per line, each starting with [ ] (to do), [~] (in progress) or "
+                                        "[x] (done)."}}, ["plan"]),
 ]

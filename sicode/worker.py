@@ -1,4 +1,4 @@
-"""The local worker: Qwen3.8-Flash-Next in qwen.exe --pipe, running its own tool loop on one task at a time."""
+"""The local model: Qwen3.8-Flash-Next in qwen.exe --pipe, running its own tool loop."""
 import json
 import os
 import re
@@ -44,6 +44,7 @@ Reminder:
 - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 </IMPORTANT>"""
 
+# For a task delegated by Claude: the reply without a tool call is a report to someone who saw none of the work.
 WORKER_PROMPT = """You are a software engineer working in the repository at the workspace root. You receive one task \
 from the lead engineer and carry it out yourself with the tools: read the relevant files before changing them, make \
 the changes, and check your work (build or run the tests when the task or the repository gives you a way to).
@@ -54,13 +55,29 @@ When the task is done, or you cannot finish it, reply without a tool call. That 
 engineer, who has not seen your work: say what you changed (files and functions), what you ran and its result, and \
 anything that is unfinished or that you are unsure about."""
 
+# For a request typed by the user: an interactive coding assistant in their terminal.
+DIRECT_PROMPT = """You are SiCode, a coding assistant working in the user's terminal, in the repository at the \
+workspace root. The user types requests and you carry them out yourself with the tools.
 
-def system_prompt(effort):
+- Answer a question that needs no look at the repository directly. Otherwise read the relevant files before you \
+answer or change anything; do not guess at code you have not read.
+- Make the changes the request asks for and no others. Check your work when there is a way to (build, run the tests).
+- For a job with several steps, call update_plan first and again as steps finish.
+- The user sees each tool call and each file change as it happens, and may decline one; if they do, do not retry \
+it, ask what they want instead.
+- A reply without a tool call ends your turn. Keep it short, since it is read in a terminal: what you did or found, \
+what you ran and its result, and anything unfinished. No headings for a short answer."""
+
+
+def system_prompt(effort, prompt, instructions=""):
     lines = [json.dumps({"type": "function", "function": {"name": t["name"], "description": t["description"],
                                                           "parameters": t["input_schema"]}}) for t in TOOLS]
     head = EFFORT[effort] + "\n\n" if EFFORT[effort] else ""
-    return head + "# Tools\n\nYou have access to the following functions:\n\n<tools>\n" + "\n".join(lines) + \
-        "\n</tools>" + TOOL_FORMAT + "\n\n" + WORKER_PROMPT
+    text = head + "# Tools\n\nYou have access to the following functions:\n\n<tools>\n" + "\n".join(lines) + \
+        "\n</tools>" + TOOL_FORMAT + "\n\n" + prompt
+    if instructions:
+        text += "\n\n# Project instructions\n\nThe repository's own notes for assistants:\n\n" + instructions
+    return text
 
 
 CALL_RE = re.compile(r"<tool_call>\s*<function=([^>\n]+)>(.*?)</function>\s*(?:</tool_call>|$)", re.S)
@@ -91,25 +108,25 @@ def parse_reply(text):
 
 
 class Engine:
-    """qwen.exe --pipe: one JSON request per line in, one JSON reply per line out. It holds the conversation."""
+    """qwen.exe --pipe: one JSON request per line in, JSON lines out. The engine holds the conversation."""
 
     def __init__(self, exe=DEFAULT_EXE, model=DEFAULT_MODEL, backend="vulkan", extra=()):
         if not os.path.exists(exe):
             raise RuntimeError(f"{exe} not found: build the engine (setup.bat) or set SICODE_ENGINE")
-        self.log_path = os.path.join(tempfile.gettempdir(), "sicode-engine.log")
+        tmp = tempfile.gettempdir()
+        self.log_path = os.path.join(tmp, "sicode-engine.log")
+        self.stop_path = os.path.join(tmp, f"sicode-stop-{os.getpid()}")  # its existence interrupts generation
         self.log = open(self.log_path, "w", encoding="utf-8", errors="replace")
         # its own process group: Ctrl+C in the console interrupts the assistant, not the loaded model
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-        self.proc = subprocess.Popen([exe, "--pipe", "--model", model, "--backend", backend, *extra], stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE, stderr=self.log,
+        self.proc = subprocess.Popen([os.path.abspath(exe), "--pipe", "--model", os.path.abspath(model), "--backend", backend, *extra],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
                                      creationflags=flags)
-        self.pending = False  # a request was sent and its reply not read yet (an interrupted turn)
-        ready = self._read()
-        self.ctx = ready["ctx"]
+        self.ctx = self._read()["ctx"]
+        self.ctx_used = 0
 
     def _read(self):
-        line = self.proc.stdout.readline()  # an interrupt here leaves `pending` set
-        self.pending = False
+        line = self.proc.stdout.readline()
         if not line:
             self.log.flush()
             with open(self.log_path, encoding="utf-8", errors="replace") as f:
@@ -120,22 +137,44 @@ class Engine:
             raise RuntimeError("engine: " + reply["error"])
         return reply
 
-    def _send(self, obj):
-        if self.pending:  # the engine is still finishing an interrupted turn: wait for it and drop the reply
-            self.proc.stdout.readline()
-        self.pending = True
+    def _write(self, obj):
         self.proc.stdin.write(json.dumps(obj).encode("ascii") + b"\n")
         self.proc.stdin.flush()
-        return self._read()
 
     def reset(self):
-        self._send({"op": "reset"})
+        self._write({"op": "reset"})
+        self._read()
+        self.ctx_used = 0
 
-    def turn(self, user, system=None, max_tokens=8192, think=True):
-        req = {"user": user, "max_tokens": max_tokens, "think": think}
+    def turn(self, user, system=None, max_tokens=8192, think=True, on_delta=None):
+        """Appends a user turn and returns the engine's reply. on_delta(text) receives the reply as it is written.
+
+        Ctrl+C stops the generation: the engine closes the partial reply, then KeyboardInterrupt is raised.
+        """
+        req = {"user": user, "max_tokens": max_tokens, "think": think, "stream": True,  # always: the delta lines are also what lets Ctrl+C be noticed
+               "interrupt_file": self.stop_path}
         if system:
             req["system"] = system
-        return self._send(req)
+        self._write(req)
+        interrupted = False
+        while True:
+            try:
+                msg = self._read()
+            except KeyboardInterrupt:
+                interrupted = True
+                open(self.stop_path, "w").close()
+                continue
+            if "delta" in msg:
+                if on_delta and not interrupted:
+                    on_delta(msg["delta"])
+                continue
+            break
+        self.ctx_used = msg.get("ctx_used", self.ctx_used)
+        if interrupted:
+            if os.path.exists(self.stop_path):
+                os.remove(self.stop_path)
+            raise KeyboardInterrupt
+        return msg
 
     def close(self):
         if self.proc.poll() is None:
@@ -147,35 +186,37 @@ class Engine:
         self.log.close()
 
 
-def run_task(engine, workspace, task, on_event=lambda kind, data: None, effort="low", max_steps=60, fresh=True):
-    """Runs one task to completion on the local model. Returns (report, stats).
+def run_task(engine, workspace, task, on_event=lambda kind, data: None, effort="low", max_steps=60, fresh=True,
+             prompt=WORKER_PROMPT, instructions="", stream=False):
+    """Runs one request to completion on the local model. Returns (final reply, stats).
 
-    fresh=False continues the conversation the engine already holds (a follow-up request) instead of starting
-    a new one.
-
-    on_event(kind, data) reports progress: ("say", text), ("call", (name, args)), ("result", text), ("stats", reply).
+    fresh=False continues the conversation the engine already holds (a follow-up) instead of starting a new one.
+    on_event(kind, data) reports progress: ("delta", text) while a reply is written (with stream), ("reply", None)
+    when one is complete, ("call", (name, args)), ("result", text), ("stats", engine reply).
     """
     if fresh:
         engine.reset()
-    stats = {"steps": 0, "gen_tokens": 0, "prefill_tokens": 0, "ctx_used": 0}
-    user, system = task, system_prompt(effort)
+    stats = {"steps": 0, "gen_tokens": 0, "prefill_tokens": 0, "ctx_used": 0, "gen_s": 0.0}
+    user, system = task, system_prompt(effort, prompt, instructions)
+    on_delta = (lambda text: on_event("delta", text)) if stream else None
+    answer = ""
     for step in range(max_steps):
-        reply = engine.turn(user, system=system if step == 0 and fresh else None)
+        reply = engine.turn(user, system=system if step == 0 and fresh else None, on_delta=on_delta)
         stats["steps"] += 1
         stats["gen_tokens"] += reply["gen_tokens"]
         stats["prefill_tokens"] += reply["prefill_tokens"]
         stats["ctx_used"] = reply["ctx_used"]
+        stats["gen_s"] += reply["gen_tokens"] / max(reply["gen_tps"], 1e-9)
         on_event("stats", reply)
+        on_event("reply", None)
         _, answer, calls = parse_reply(reply["text"])
-        if answer:
-            on_event("say", answer)
         if reply["ctx_used"] > reply["ctx"] - 12000:
-            return (answer + "\n\n[worker stopped: its context is full; the task is not finished]").strip(), stats
+            return (answer + "\n\n[stopped: the local model's context is full; the request is not finished]").strip(), stats
         if not calls:
             if not reply["finished"]:  # cut off by the token limit, mid-thought or mid-call
                 user = "Your last reply was cut off at the length limit. Continue; write long files in several edits."
                 continue
-            return answer or "[the worker returned an empty report]", stats
+            return answer or "[the local model returned an empty reply]", stats
         results = []
         for name, args in calls:
             on_event("call", (name, args))
@@ -184,4 +225,4 @@ def run_task(engine, workspace, task, on_event=lambda kind, data: None, effort="
             on_event("result", result)
             results.append(f"<tool_response>\n{result}\n</tool_response>")
         user = "\n".join(results)
-    return f"[worker stopped after {max_steps} steps without finishing]\n{answer}", stats
+    return f"[stopped after {max_steps} steps without finishing]\n{answer}", stats
