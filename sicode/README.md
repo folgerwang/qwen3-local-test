@@ -10,14 +10,20 @@ A terminal coding assistant in two layers:
 
 ## Install
 
-From the repository root, after building the engine and downloading the model (`setup.bat --model flash-gguf`):
+On 64-bit Windows, from the wheel on the [releases page](https://github.com/folgerwang/qwen3-local-test/releases):
 
 ```
-pip install -e .
+pip install sicode-0.2.0-py3-none-win_amd64.whl
+sicode --download-model
 ```
 
-The editable install finds the engine and the model inside the repository. For a regular install
-(`pip install .`), point it at them:
+The wheel includes a prebuilt engine. `--download-model` fetches Qwen3.8-Flash-Next UD-Q4_K_XL and its draft head
+(about 115 GB) from Hugging Face into `~/.sicode/models`; it resumes if interrupted. The engine needs a CPU with
+AVX-512, a Vulkan 1.3 GPU driver (or `--backend cpu`) and the Microsoft Visual C++ runtime.
+
+From a checkout of the repository, after `setup.bat`, `pip install -e .` uses the engine and the model of the
+checkout instead. The engine is looked for in this order: `SICODE_ENGINE`, the checkout's `build\Release`, the one in
+the wheel. The model: `SICODE_MODEL`, the checkout's `models`, `~/.sicode/models`. To set them explicitly:
 
 ```
 set SICODE_ENGINE=G:\work\qwen3-local-test\build\Release\qwen.exe
@@ -69,6 +75,7 @@ diff. Ctrl+C stops the current reply and keeps the conversation.
 | `/model [name]` | Claude model for `[c]`: `opus`, `sonnet`, `haiku`, `fable` or a full id |
 | `/think` | shows or hides the local model's reasoning |
 | `/key` | sets the Claude API key |
+| `/exit`, `exit`, `quit` | leaves SiCode |
 
 ### Permissions
 

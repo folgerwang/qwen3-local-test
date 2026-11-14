@@ -11,19 +11,23 @@ From-scratch C++ inference engine for Qwen MoE models (CPU AVX-512 + hand-writte
 A terminal coding assistant built on this engine: requests run on the local Qwen3.8-Flash-Next, and a request that
 starts with `[c]` is planned and reviewed by Claude over the Claude API while the local model does the work.
 
-**Download:** [sicode-0.1.0-py3-none-any.whl](https://github.com/folgerwang/qwen3-local-test/releases/download/sicode-v0.1.0/sicode-0.1.0-py3-none-any.whl)
+**Download:** [sicode-0.2.0-py3-none-win_amd64.whl](https://github.com/folgerwang/qwen3-local-test/releases/download/sicode-v0.2.0/sicode-0.2.0-py3-none-win_amd64.whl)
 ([all releases](https://github.com/folgerwang/qwen3-local-test/releases))
 
 ```
-pip install sicode-0.1.0-py3-none-any.whl
-set SICODE_ENGINE=<this repo>\build\Release\qwen.exe
-set SICODE_MODEL=<this repo>\models\Qwen3.8-Flash-Next-GGUF\UD-Q4_K_XL
+pip install sicode-0.2.0-py3-none-win_amd64.whl
+sicode --download-model        # once: the local model, about 115 GB, to ~/.sicode/models
 cd your-project
-python -m sicode
+sicode
 ```
 
-From a checkout of this repository, `pip install -e .` needs no paths. The wheel holds only the assistant; the engine
-and the model come from the Setup section below. Details: [sicode/README.md](sicode/README.md).
+![Installing SiCode and listing its command-line options in cmd](docs/sicode-cmd.png)
+
+The wheel holds the assistant and a prebuilt engine (`qwen.exe`) for 64-bit Windows; nothing has to be compiled. It
+needs Python 3.10 or later, a CPU with AVX-512, a GPU with a Vulkan 1.3 driver (`--backend cpu` runs without one,
+slowly) and the Microsoft Visual C++ runtime. If `sicode` is not found after installing, pip put it in a folder that
+is not on PATH; `python -m sicode` does the same. From a checkout of this repository, `pip install -e .` uses the
+engine and the model from the Setup section below. Details: [sicode/README.md](sicode/README.md).
 
 ## Setup
 

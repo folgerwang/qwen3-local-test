@@ -8,8 +8,39 @@ import tempfile
 from .tools import TOOLS
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_EXE = os.environ.get("SICODE_ENGINE") or os.path.join(REPO, "build", "Release", "qwen.exe")
-DEFAULT_MODEL = os.environ.get("SICODE_MODEL") or os.path.join(REPO, "models", "Qwen3.8-Flash-Next-GGUF", "UD-Q4_K_XL")
+HOME_MODELS = os.path.join(os.path.expanduser("~"), ".sicode", "models")  # where `sicode --download-model` puts it
+MODEL_REPO, MODEL_DIR, MODEL_QUANT = "unsloth/Qwen3.8-Flash-Next-GGUF", "Qwen3.8-Flash-Next-GGUF", "UD-Q4_K_XL"
+
+
+def _first(paths):
+    return next((p for p in paths if os.path.exists(p)), paths[-1])
+
+
+# The engine: SICODE_ENGINE, a build in a checkout of the repository, or the one shipped inside the wheel.
+DEFAULT_EXE = os.environ.get("SICODE_ENGINE") or _first([
+    os.path.join(REPO, "build", "Release", "qwen.exe"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "qwen.exe")])
+# The model: SICODE_MODEL, the checkout's models folder, or the download folder in the user's home.
+DEFAULT_MODEL = os.environ.get("SICODE_MODEL") or _first([
+    os.path.join(REPO, "models", MODEL_DIR, MODEL_QUANT),
+    os.path.join(HOME_MODELS, MODEL_DIR, MODEL_QUANT)])
+
+
+def download_model(dst=None):
+    """Downloads Qwen3.8-Flash-Next UD-Q4_K_XL (about 111 GB) and its draft head (4 GB) from Hugging Face.
+
+    Re-running resumes and skips files that are already complete. Returns the model folder.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        import sys
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "huggingface_hub"])
+        from huggingface_hub import snapshot_download
+    dst = dst or os.path.join(HOME_MODELS, MODEL_DIR)
+    print(f"{MODEL_REPO} {MODEL_QUANT} -> {dst}")
+    snapshot_download(repo_id=MODEL_REPO, local_dir=dst, allow_patterns=[MODEL_QUANT + "/*", "mtp-*.gguf"], max_workers=8)
+    return os.path.join(dst, MODEL_QUANT)
 
 # The system block the model's chat template (tokenizer.chat_template in the GGUF) renders for tool use.
 EFFORT = {
@@ -113,6 +144,9 @@ class Engine:
     def __init__(self, exe=DEFAULT_EXE, model=DEFAULT_MODEL, backend="vulkan", extra=()):
         if not os.path.exists(exe):
             raise RuntimeError(f"{exe} not found: build the engine (setup.bat) or set SICODE_ENGINE")
+        if not os.path.exists(model):
+            raise RuntimeError(f"the model is not at {model}: run `sicode --download-model` (about 115 GB) "
+                               "or set SICODE_MODEL")
         tmp = tempfile.gettempdir()
         self.log_path = os.path.join(tmp, "sicode-engine.log")
         self.stop_path = os.path.join(tmp, f"sicode-stop-{os.getpid()}")  # its existence interrupts generation

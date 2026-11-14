@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 
+from . import __version__
 from .tools import TOOLS, Workspace, clip
 from .worker import DEFAULT_EXE, DEFAULT_MODEL, DIRECT_PROMPT, WORKER_PROMPT, Engine, parse_reply, run_task
 
@@ -625,6 +626,8 @@ class App:
                 break
             if not text:
                 continue
+            if text.strip().lower() in ("exit", "quit"):  # typed without the slash
+                break
             try:
                 if text.startswith("/"):
                     if not self.command(text):
@@ -645,21 +648,29 @@ class App:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Requests run on the local Qwen3.8-Flash-Next; start one with [c] "
+    ap = argparse.ArgumentParser(prog="sicode", description="Requests run on the local Qwen3.8-Flash-Next; start one with [c] "
                                              "to have Claude plan and review it.")
     ap.add_argument("--dir", default=os.getcwd(), help="workspace (default: the current directory)")
     ap.add_argument("--mode", default="ask", choices=list(MODES),
                     help="ask before file changes and shell commands (default), only before commands (edits), or never (auto)")
     ap.add_argument("--yes", action="store_true", help="the same as --mode auto")
     ap.add_argument("--model", default="claude-opus-5-5", help="Claude model for [c] requests")
-    ap.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"])
+    ap.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"],
+                    help="reasoning effort of Claude")
     ap.add_argument("--worker-effort", default="low", choices=["low", "medium", "xhigh"],
                     help="reasoning effort of the local model")
-    ap.add_argument("--exe", default=DEFAULT_EXE)
-    ap.add_argument("--worker-model", default=DEFAULT_MODEL)
-    ap.add_argument("--backend", default="vulkan")
+    ap.add_argument("--exe", default=DEFAULT_EXE, metavar="PATH", help="the engine (default: the bundled qwen.exe)")
+    ap.add_argument("--worker-model", default=DEFAULT_MODEL, metavar="PATH", help="folder of the local model")
+    ap.add_argument("--backend", default="vulkan", choices=["vulkan", "cpu"], help="where the local model runs")
     ap.add_argument("-p", "--prompt", help="run one request and exit; may start with [c] or [l]")
+    ap.add_argument("--download-model", action="store_true",
+                    help="download the local model (about 115 GB) to ~/.sicode/models and exit")
+    ap.add_argument("--version", action="version", version="sicode " + __version__)
     a = ap.parse_args()
+    if a.download_model:
+        from .worker import download_model
+        print("downloaded to " + download_model())
+        return
     if a.yes:
         a.mode = "auto"
     a.model = MODEL_ALIASES.get(a.model.lower(), a.model)
