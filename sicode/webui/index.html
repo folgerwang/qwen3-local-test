@@ -1,0 +1,621 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SiCode</title>
+<style>
+:root {
+  --bg: #f7f5f0; --panel: #efece5; --card: #ffffff; --line: #e0dbd0; --text: #24221d; --dim: #77726a;
+  --accent: #b5532c; --accent-text: #ffffff; --ok: #2f7d4f; --bad: #b3372f; --warn: #a66a00;
+  --add: #e3f4e6; --del: #fbe6e3; --code: #f1eee7; --user: #e9e4d8; --shadow: 0 1px 2px rgba(40, 30, 10, .08);
+  --mono: "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  --sans: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1d1c19; --panel: #171614; --card: #262521; --line: #38362f; --text: #ece8df; --dim: #9a958a;
+    --accent: #e0825a; --accent-text: #1d1c19; --ok: #6cc08b; --bad: #ef8377; --warn: #e0b060;
+    --add: #1f3526; --del: #45211e; --code: #2d2b26; --user: #34322c; --shadow: none;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); font: 14.5px/1.55 var(--sans); display: grid;
+  grid-template-columns: 264px minmax(0, 1fr) 312px; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; }
+button, select, input, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; border: 1px solid var(--line); background: var(--card); border-radius: 8px; padding: 6px 12px; }
+button:hover { border-color: var(--dim); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+button.ghost { background: none; border-color: transparent; padding: 4px 8px; color: var(--dim); }
+button.ghost:hover { color: var(--text); background: var(--line); }
+button:disabled { opacity: .45; cursor: default; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+h1, h2, h3 { font-family: var(--serif); font-weight: 600; margin: 0; }
+.dim { color: var(--dim); }
+.mono { font-family: var(--mono); font-size: 12.5px; }
+
+/* status bar */
+#top { grid-column: 1 / -1; display: flex; gap: 26px; align-items: center; justify-content: flex-end; padding: 5px 16px;
+  background: var(--panel); border-bottom: 1px solid var(--line); font-size: 12px; color: var(--dim); flex-wrap: wrap; }
+#top .g { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+#top .g b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+#top .bar { width: 84px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+#top .bar i { display: block; height: 100%; width: 0; background: var(--accent); }
+#top .bar.high i { background: var(--bad); }
+#top .bar.good i { background: var(--ok); }
+
+/* sidebar */
+#side { background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+#side header { padding: 16px 16px 10px; display: flex; align-items: baseline; gap: 8px; }
+#side header h1 { font-size: 21px; letter-spacing: -.01em; }
+#side header span { font-size: 11.5px; color: var(--dim); }
+#new { margin: 4px 12px 10px; text-align: left; }
+#tasks { flex: 1; overflow-y: auto; padding: 0 8px 8px; }
+#tasks .label { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--dim); padding: 10px 8px 4px; }
+.task { display: flex; align-items: center; gap: 6px; padding: 7px 8px; border-radius: 8px; cursor: pointer; }
+.task:hover { background: var(--line); }
+.task.on { background: var(--card); box-shadow: var(--shadow); }
+.task .t { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task .x { visibility: hidden; padding: 0 6px; }
+.task:hover .x { visibility: visible; }
+.spin { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); animation: pulse 1.1s infinite ease-in-out; flex: none; }
+@keyframes pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+#side footer { border-top: 1px solid var(--line); padding: 8px 12px; display: flex; justify-content: space-between; align-items: center; font-size: 12.5px; }
+
+/* main */
+#main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+#head { padding: 12px 24px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 12px; min-height: 52px; }
+#head h2 { font-size: 16.5px; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chip { font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; color: var(--dim);
+  max-width: 340px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; background: none; }
+#scroll { flex: 1; overflow-y: auto; padding: 22px 24px 8px; }
+#feed { max-width: 780px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
+.empty { max-width: 620px; margin: 9vh auto 0; text-align: center; }
+.empty h2 { font-size: 30px; margin-bottom: 8px; letter-spacing: -.015em; }
+.empty .sugs { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 22px; }
+.empty .sugs button { border-radius: 999px; font-size: 13px; }
+.it.sub { margin-left: 22px; }
+.user { align-self: flex-end; background: var(--user); border-radius: 14px 14px 4px 14px; padding: 9px 14px; max-width: 86%; white-space: pre-wrap; overflow-wrap: anywhere; }
+.user .via { display: block; font-size: 11px; color: var(--dim); margin-top: 2px; }
+.assistant { overflow-wrap: anywhere; }
+.assistant .who { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--accent); font-weight: 600; }
+.md p { margin: .45em 0; } .md > :first-child { margin-top: 0; } .md > :last-child { margin-bottom: 0; }
+.md h3, .md h4, .md h5 { font-family: var(--serif); margin: .9em 0 .3em; font-size: 1.08em; }
+.md h3 { font-size: 1.22em; }
+.md ul, .md ol { margin: .4em 0; padding-left: 1.5em; }
+.md code { font-family: var(--mono); font-size: .88em; background: var(--code); padding: 1px 5px; border-radius: 4px; }
+.md pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow-x: auto; margin: .6em 0; }
+.md pre code { background: none; padding: 0; font-size: 12.5px; line-height: 1.5; }
+.md table { border-collapse: collapse; margin: .6em 0; display: block; overflow-x: auto; }
+.md th, .md td { border: 1px solid var(--line); padding: 4px 10px; text-align: left; }
+.md a { color: var(--accent); }
+details.think { color: var(--dim); font-size: 13px; }
+details.think summary { cursor: pointer; list-style: none; display: inline-flex; gap: 6px; align-items: center; }
+details.think summary::-webkit-details-marker { display: none; }
+details.think div { white-space: pre-wrap; border-left: 2px solid var(--line); padding: 2px 0 2px 12px; margin-top: 4px; }
+.row { display: flex; gap: 8px; align-items: baseline; font-size: 13px; color: var(--dim); }
+.row .n { color: var(--text); font-weight: 600; flex: none; }
+.row .a { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .s { flex: none; margin-left: auto; font-size: 12px; }
+.s.ok { color: var(--ok); } .s.bad { color: var(--bad); } .s.wait { color: var(--warn); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); overflow: hidden; }
+.card > .top { display: flex; gap: 8px; align-items: center; padding: 8px 12px; font-size: 13px; }
+.card > .top .grow { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card pre { margin: 0; padding: 8px 12px; font: 12.5px/1.5 var(--mono); overflow: auto; max-height: 300px; border-top: 1px solid var(--line); white-space: pre; }
+.card pre.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+.diff span { display: block; padding: 0 12px; margin: 0 -12px; min-height: 1.5em; }
+.diff .p { background: var(--add); } .diff .m { background: var(--del); } .diff .h { color: var(--dim); }
+.ask { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-top: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+.ask span { flex: 1; font-size: 13px; min-width: 140px; }
+.plan { padding: 10px 14px; }
+.plan div, #progress div.step { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; }
+.box { flex: none; width: 14px; height: 14px; border: 1.5px solid var(--dim); border-radius: 4px; display: inline-block; position: relative; top: 2px; }
+.done .box { background: var(--ok); border-color: var(--ok); } .done .box::after { content: ""; position: absolute; left: 3.5px; top: 0.5px; width: 3.5px; height: 7px; border: solid var(--card); border-width: 0 2px 2px 0; transform: rotate(45deg); }
+.doing .box { border-color: var(--accent); background: radial-gradient(var(--accent) 38%, transparent 42%); }
+.done .tx { color: var(--dim); text-decoration: line-through; }
+.by { font: 600 11.5px var(--mono); border-radius: 4px; padding: 0 4px; flex: none; }
+.by.l { color: var(--ok); background: var(--add); } .by.c { color: var(--accent); background: var(--del); }
+.note { font-size: 12.5px; color: var(--dim); text-align: center; }
+.error { color: var(--bad); border: 1px solid var(--bad); border-radius: 8px; padding: 8px 12px; font-size: 13.5px; }
+.stats { font-size: 12px; color: var(--dim); }
+
+/* composer */
+#compose { padding: 10px 24px 18px; }
+#box { max-width: 780px; margin: 0 auto; background: var(--card); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); padding: 10px 12px 8px; }
+#box:focus-within { border-color: var(--dim); }
+#text { width: 100%; border: 0; outline: 0; resize: none; background: none; max-height: 220px; min-height: 26px; display: block; }
+#bar { display: flex; gap: 8px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; background: none; padding: 4px 10px; font-size: 12.5px; color: var(--dim); }
+.seg button.on { background: var(--line); color: var(--text); font-weight: 600; }
+#bar select { border: 1px solid var(--line); background: none; border-radius: 8px; padding: 4px 6px; font-size: 12.5px; }
+#bar .sp { flex: 1; }
+#hint { max-width: 780px; margin: 6px auto 0; font-size: 11.5px; color: var(--dim); text-align: center; }
+
+/* right panel */
+#info { background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+#info section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+#info h3 { font-size: 14px; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }
+#info .f { display: flex; gap: 6px; padding: 2px 4px; border-radius: 6px; cursor: pointer; font-size: 13px; white-space: nowrap; overflow: hidden; }
+#info .f:hover { background: var(--line); }
+#info .f span { overflow: hidden; text-overflow: ellipsis; }
+#info .kids { margin-left: 14px; }
+.meter { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin: 6px 0; }
+.meter i { display: block; height: 100%; background: var(--accent); }
+.kv { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--dim); gap: 8px; }
+.kv b { color: var(--text); font-weight: 500; text-align: right; }
+
+/* dialogs */
+dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--text); padding: 0; width: min(860px, 92vw); max-height: 86vh; box-shadow: 0 12px 40px rgba(0, 0, 0, .3); }
+dialog::backdrop { background: rgba(20, 15, 5, .45); }
+dialog .dh { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+dialog .dh h3 { flex: 1; font-size: 15.5px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+dialog .db { padding: 14px 16px; overflow: auto; max-height: calc(86vh - 110px); }
+dialog .df { padding: 10px 16px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 8px; }
+dialog pre { margin: 0; font: 12.5px/1.5 var(--mono); white-space: pre; }
+dialog label { display: block; font-size: 12.5px; color: var(--dim); margin: 12px 0 4px; }
+dialog label:first-child { margin-top: 0; }
+dialog input[type=text], dialog input[type=password], dialog select { width: 100%; border: 1px solid var(--line); background: var(--bg); border-radius: 8px; padding: 7px 10px; }
+.dir { padding: 5px 8px; border-radius: 6px; cursor: pointer; display: flex; gap: 8px; } .dir:hover { background: var(--line); }
+.dir.file { color: var(--dim); cursor: default; } .dir.file:hover { background: none; } .dir .ic { flex: none; width: 1.3em; text-align: center; }
+
+@media (max-width: 1100px) { body { grid-template-columns: 220px minmax(0, 1fr); } #info { display: none; } }
+@media (max-width: 700px) { body { grid-template-columns: minmax(0, 1fr); } #side { display: none; } #scroll, #compose { padding-left: 14px; padding-right: 14px; } }
+</style>
+</head>
+<body>
+<div id="top" aria-label="Memory and cache">
+  <div class="g" id="g-ram" title="Physical memory in use on this computer"><span>RAM</span><div class="bar"><i></i></div><b>-</b></div>
+  <div class="g" id="g-vram" title="GPU memory in use, by every program"><span>VRAM</span><div class="bar"><i></i></div><b>-</b></div>
+  <div class="g" id="g-cache" title="Share of expert lookups served from VRAM instead of computed on the CPU"><span>VRAM cache rate</span><div class="bar good"><i></i></div><b>-</b></div>
+</div>
+<aside id="side">
+  <header><h1>SiCode</h1><span id="ver"></span></header>
+  <button id="new" class="primary">+ New task</button>
+  <div id="tasks"></div>
+  <footer><span id="keystate" class="dim"></span><button class="ghost" id="settings">Settings</button></footer>
+</aside>
+
+<main id="main">
+  <div id="head"><h2 id="title"></h2><button class="chip" id="folder" title="Working folder"></button></div>
+  <div id="scroll"><div id="feed"></div></div>
+  <div id="compose">
+    <div id="box">
+      <textarea id="text" rows="1" placeholder="Describe a task, or ask about this folder"></textarea>
+      <div id="bar">
+        <div class="seg" id="route" role="group" aria-label="Who handles the request">
+          <button data-r="local" class="on" title="The local Qwen3.8-Flash-Next does everything, on your GPU">Local</button>
+          <button data-r="hybrid" id="hybridbtn">Mix</button>
+          <button data-r="cloud" id="cloudbtn">Claude</button>
+        </div>
+        <select id="mode" title="Permissions"></select>
+        <span class="sp"></span>
+        <button id="send" class="primary">Send</button>
+      </div>
+    </div>
+    <div id="hint">Enter sends, Shift+Enter adds a line. @path attaches a file from the folder.</div>
+  </div>
+</main>
+
+<aside id="info">
+  <section><h3>Context <button class="ghost" id="compact" title="Replace the local conversation by its summary">Compact</button></h3><div id="context"></div></section>
+  <section><h3>Progress</h3><div id="progress" class="dim">No plan yet. Longer jobs show their steps here.</div></section>
+  <section><h3>Changed files <button class="ghost" id="undo" title="Put back the files changed by the last request">Undo</button></h3><div id="changed" class="dim">Nothing changed in this task.</div></section>
+  <section><h3>Folder</h3><div id="tree"></div></section>
+</aside>
+
+<dialog id="filedlg"><div class="dh"><h3 id="filename"></h3><div class="seg" id="fileview"><button data-v="text" class="on">File</button><button data-v="diff">Changes</button></div><button class="ghost" data-close>Close</button></div><div class="db"><pre id="filebody"></pre></div></dialog>
+<dialog id="dirdlg"><div class="dh"><h3>New task: choose the working folder</h3><button class="ghost" data-close>Close</button></div><div class="db">
+  <label for="dirinput">Folder path (type or paste one and press Enter, or pick below)</label>
+  <div style="display:flex;gap:8px"><input type="text" id="dirinput" class="mono" autocomplete="off" spellcheck="false"><button id="dirgo">Open</button><button id="dirbrowse" title="Open the Windows folder dialog">Browse...</button></div>
+  <div id="recent"></div>
+  <label>In this folder</label><div id="dirs" style="max-height:38vh;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:4px"></div></div><div class="df"><span class="dim" id="direrr" style="flex:1;font-size:12.5px;align-self:center"></span><button class="primary" id="usedir">Start a task here</button></div></dialog>
+<dialog id="setdlg"><div class="dh"><h3>Settings</h3><button class="ghost" data-close>Close</button></div><div class="db">
+  <label for="planner">The cloud model, for the Mix and cloud modes</label><select id="planner"></select>
+  <div class="dim" id="plannernote" style="font-size:12.5px;margin-top:6px"></div>
+  <label for="localmodel">Local model</label><select id="localmodel"></select>
+  <div class="dim" id="localnote" style="font-size:12.5px;margin-top:6px"></div>
+  <label for="vramcap">Most VRAM in use on the card, in GB, counting other programs (0 = no cap)</label><input type="text" id="vramcap" inputmode="decimal" autocomplete="off">
+  <div class="dim" id="vramnote" style="font-size:12.5px;margin-top:6px"></div>
+  <label for="key">Claude API key (only for the "Claude API key" planner; saved in ~/.sicode/config.json)</label><input type="password" id="key" placeholder="sk-ant-..." autocomplete="off">
+  <label for="model">Claude model (Claude API key planner)</label><select id="model"><option value="claude-opus-5-5">Claude Opus 5.5</option><option value="claude-fable-5-1">Claude Fable 5.1</option><option value="claude-sonnet-5-5">Claude Sonnet 5.5</option><option value="claude-haiku-5-5">Claude Haiku 5.5</option></select>
+  <label for="effort">Claude reasoning effort</label><select id="effort"><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select>
+</div><div class="df"><button class="primary" id="saveset">Save</button></div></dialog>
+
+<script>
+const $ = id => document.getElementById(id);
+const token = new URLSearchParams(location.search).get('t') || '';
+let st = null, cur = null, task = null, items = [], rev = 0, route = 'local', changed = [], undoN = 0, nodes = new Map();
+const openDirs = new Set();
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {headers: {'X-SiCode-Token': token}}
+    : {method: 'POST', headers: {'X-SiCode-Token': token, 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  return r.json();
+}
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
+const esc = s => s.replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+
+// --- a small Markdown renderer (the text is escaped first) ---
+function inline(s) {
+  const codes = [];
+  s = esc(s).replace(/`([^`\n]+)`/g, (m, c) => { codes.push(c); return '\u0001' + (codes.length - 1) + '\u0001'; });
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>').replace(/(^|[\s(])\*([^*\s][^*\n]*)\*/g, '$1<em>$2</em>')
+       .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return s.replace(/\u0001(\d+)\u0001/g, (m, i) => '<code>' + codes[+i] + '</code>');
+}
+function md(src) {
+  const lines = src.replace(/\r/g, '').split('\n'), out = [];
+  let i = 0, para = [], list = null;
+  const flushP = () => { if (para.length) { out.push('<p>' + para.map(inline).join('<br>') + '</p>'); para = []; } };
+  const flushL = () => { if (list) { out.push('</' + list + '>'); list = null; } };
+  while (i < lines.length) {
+    const l = lines[i];
+    if (/^\s*```/.test(l)) {
+      flushP(); flushL();
+      const body = [];
+      for (i++; i < lines.length && !/^\s*```/.test(lines[i]); i++) body.push(lines[i]);
+      i++;
+      out.push('<pre><code>' + esc(body.join('\n')) + '</code></pre>');
+      continue;
+    }
+    if (/^\s*\|.*\|\s*$/.test(l) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+      flushP(); flushL();
+      const cells = r => r.trim().replace(/^\||\|$/g, '').split('|').map(c => inline(c.trim()));
+      let t = '<table><tr>' + cells(l).map(c => '<th>' + c + '</th>').join('') + '</tr>';
+      for (i += 2; i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]); i++) t += '<tr>' + cells(lines[i]).map(c => '<td>' + c + '</td>').join('') + '</tr>';
+      out.push(t + '</table>');
+      continue;
+    }
+    let m;
+    if ((m = /^(#{1,6})\s+(.*)$/.exec(l))) { flushP(); flushL(); const h = Math.min(5, m[1].length + 2); out.push('<h' + h + '>' + inline(m[2]) + '</h' + h + '>'); }
+    else if ((m = /^\s*([-*]|\d+[.)])\s+(.*)$/.exec(l))) {
+      flushP();
+      const kind = /\d/.test(m[1]) ? 'ol' : 'ul';
+      if (list !== kind) { flushL(); out.push('<' + kind + '>'); list = kind; }
+      out.push('<li>' + inline(m[2]) + '</li>');
+    }
+    else if (!l.trim()) { flushP(); flushL(); }
+    else { flushL(); para.push(l); }
+    i++;
+  }
+  flushP(); flushL();
+  return out.join('');
+}
+
+// --- items of a task ---
+const TOOL = {read_file: 'Read', list_files: 'Listed files', search: 'Searched'};
+function status(it) {
+  const m = {running: ['working', 'wait'], pending: ['needs your answer', 'wait'], done: ['', 'ok'], applied: ['applied', 'ok'],
+    declined: ['declined', 'bad'], error: ['failed', 'bad'], stopped: ['stopped', 'bad']}[it.status] || ['', ''];
+  const s = el('span', 's ' + m[1], m[0]);
+  if (it.status === 'running') s.prepend(Object.assign(el('span', 'spin'), {style: 'display:inline-block;margin-right:6px'}));
+  return s;
+}
+function asker(it, question, always) {
+  const a = el('div', 'ask');
+  a.append(el('span', '', question));
+  for (const [label, answer, cls] of [['Allow', 'yes', 'primary'], [always, 'always', ''], ['Decline', 'no', '']]) {
+    const b = el('button', cls, label);
+    b.onclick = () => { a.querySelectorAll('button').forEach(x => x.disabled = true); api('/api/approve', {id: it.id, answer}); };
+    a.append(b);
+  }
+  return a;
+}
+// [l] / [c]: who does a step in the Mix mode
+function by(who) { const b = el('span', 'by ' + who, '[' + who + ']'); b.title = who === 'l' ? 'The local model' : 'The cloud model'; return b; }
+function view(it) {
+  const w = el('div', 'it' + (it.sub ? ' sub' : ''));
+  if (it.type === 'user') {
+    const b = el('div', 'user', it.text);
+    if (it.route === 'hybrid' || it.route === 'claude') b.append(el('span', 'via', 'mix: steps marked [l] run on the local model, [c] in the cloud'));
+    else if (it.route === 'cloud') b.append(el('span', 'via', 'cloud: done by the cloud model'));
+    w.style.display = 'flex'; w.style.justifyContent = 'flex-end';
+    w.append(b);
+  } else if (it.type === 'assistant') {
+    const a = el('div', 'assistant');
+    if (it.who === 'claude' || it.who === 'codex') a.append(el('div', 'who', it.who === 'codex' ? 'Codex' : 'Claude'));
+    const body = el('div', 'md'); body.innerHTML = md(it.text || '');
+    a.append(body); w.append(a);
+  } else if (it.type === 'think') {
+    // a finished thought of a line or two is not worth a row; longer ones stay available, folded
+    if (it.status !== 'running' && (it.text || '').trim().length < 240) { w.style.display = 'none'; return w; }
+    const d = el('details', 'think');
+    const s = el('summary');
+    if (it.status === 'running') s.append(el('span', 'spin'));
+    s.append(el('span', '', it.status === 'running' ? 'Thinking' : 'Reasoning'));
+    d.append(s, el('div', '', (it.text || '').trim()));
+    w.append(d);
+  } else if (it.type === 'tool') {
+    const r = el('div', 'row');
+    if (it.by) r.append(by(it.by));
+    r.append(el('span', 'n', TOOL[it.name] || it.name), el('span', 'a mono', (it.args || '').replace(/^(path|pattern)=/, '').replace(/^'(.*)'$/, '$1')), status(it));
+    if (it.status === 'error' && it.output) { r.title = it.output; }
+    w.append(r);
+  } else if (it.type === 'command') {
+    const c = el('div', 'card'), top = el('div', 'top');
+    if (it.by) top.append(by(it.by));
+    top.append(el('span', 'dim', 'Command'), el('span', 'grow mono', it.command), status(it));
+    if (it.exit && it.exit !== 'exit code 0') top.append(el('span', 's bad', it.exit));
+    c.append(top);
+    if (it.status === 'pending') c.append(asker(it, 'Run this command?', 'Always allow ' + (it.first || 'this')));
+    if (it.output) { const d = el('details'); d.append(el('summary', 'dim', 'Output'), el('pre', '', it.output)); d.querySelector('summary').style.cssText = 'padding:4px 12px;cursor:pointer;font-size:12.5px;border-top:1px solid var(--line)'; c.append(d); }
+    w.append(c);
+  } else if (it.type === 'diff') {
+    const c = el('div', 'card'), top = el('div', 'top');
+    if (it.by) top.append(by(it.by));
+    top.append(el('span', 'dim', it.deleted ? 'Deleted' : it.new_file ? 'New file' : 'Edit'), el('span', 'grow mono', it.path),
+               el('span', 's ok', '+' + it.added), el('span', 's bad', '−' + it.removed), status(it));
+    const pre = el('pre', 'diff');
+    for (const line of it.lines) pre.append(el('span', line[0] === '+' ? 'p' : line[0] === '-' ? 'm' : line[0] === '@' ? 'h' : '', line || ' '));
+    if (it.more) pre.append(el('span', 'h', '... ' + it.more + ' more lines'));
+    c.append(top, pre);
+    if (it.status === 'pending') c.append(asker(it, 'Apply this change?', 'Always allow edits'));
+    w.append(c);
+  } else if (it.type === 'plan') {
+    const c = el('div', 'card plan');
+    for (const s of it.steps) { const d = el('div', s.state); d.append(el('span', 'box')); if (s.who) d.append(by(s.who)); d.append(el('span', 'tx', s.text)); c.append(d); }
+    w.append(c);
+  } else if (it.type === 'delegate') {
+    const c = el('div', 'card'), top = el('div', 'top');
+    top.append(by('l'), el('span', 'dim', 'Handed to the local model'), el('span', 'grow', (it.text || '').trim().split('\n')[0]), status(it));
+    if (it.stats) top.append(el('span', 's', it.stats));
+    const d = el('details'); d.append(el('summary', 'dim', 'Brief'), el('pre', 'wrap', it.text || ''));
+    d.querySelector('summary').style.cssText = 'padding:4px 12px;cursor:pointer;font-size:12.5px;border-top:1px solid var(--line)';
+    c.append(top, d); w.append(c);
+  } else if (it.type === 'error') w.append(el('div', 'error', it.text));
+  else if (it.type === 'stats') w.append(el('div', 'stats', it.text));
+  else { const n = el('div', 'note'); if (it.status === 'running') n.append(Object.assign(el('span', 'spin'), {style: 'display:inline-block;margin-right:6px'})); n.append(it.text || ''); w.append(n); }
+  return w;
+}
+function nearBottom() { const s = $('scroll'); return s.scrollHeight - s.scrollTop - s.clientHeight < 140; }
+function toBottom() { const s = $('scroll'); s.scrollTop = s.scrollHeight; }
+function place(it) {
+  const stick = nearBottom(), old = nodes.get(it.id), n = view(it);
+  if (old) { if (old.querySelector('details[open]')) n.querySelector('details')?.setAttribute('open', ''); old.replaceWith(n); } else $('feed').append(n);
+  nodes.set(it.id, n);
+  if (it.type === 'plan') showProgress(it.steps);
+  if (stick) toBottom();
+}
+const pending = new Set(); let raf = 0;
+function later(it) { pending.add(it); if (!raf) raf = requestAnimationFrame(() => { raf = 0; for (const x of pending) place(x); pending.clear(); }); }
+function showProgress(steps) {
+  const p = $('progress'); p.textContent = ''; p.className = '';
+  for (const s of steps) { const d = el('div', 'step ' + s.state); d.append(el('span', 'box')); if (s.who) d.append(by(s.who)); d.append(el('span', 'tx', s.text)); p.append(d); }
+}
+function renderFeed() {
+  const f = $('feed'); f.textContent = ''; nodes.clear();
+  $('progress').className = 'dim'; $('progress').textContent = 'No plan yet. Longer jobs show their steps here.';
+  if (!items.length) {
+    const e = el('div', 'empty');
+    e.append(el('h2', '', 'What should we work on?'), el('div', 'dim', 'SiCode reads, edits and runs things in the working folder. You see every change and command, and can decline any of them.'));
+    const s = el('div', 'sugs');
+    for (const t of ['Explain what this project does and how it is laid out', 'Find and fix the failing tests', 'Review the code for bugs and risky spots', 'Write the project notes (SICODE.md)'])
+      { const b = el('button', '', t); b.onclick = () => { $('text').value = t.startsWith('Write the project notes') ? '/init' : t; send(); }; s.append(b); }
+    e.append(s); f.append(e);
+  }
+  for (const it of items) place(it);
+  toBottom();
+}
+
+// --- side panels ---
+function renderSide() {
+  $('ver').textContent = 'v' + st.version;
+  const box = $('tasks'); box.textContent = '';
+  if (st.tasks.length) box.append(el('div', 'label', 'Tasks'));
+  for (const t of st.tasks) {
+    const d = el('div', 'task' + (t.id === cur ? ' on' : ''));
+    if (st.busy === t.id) d.append(el('span', 'spin'));
+    const name = el('span', 't', t.title); name.title = t.title + '\n' + t.workspace;
+    const x = el('button', 'ghost x', '×'); x.title = 'Delete this task';
+    x.onclick = async e => { e.stopPropagation(); if (!confirm('Delete the task "' + t.title + '"? Files it changed stay as they are.')) return;
+      await api('/api/delete', {task: t.id}); if (t.id === cur) { cur = null; pick(); } };
+    d.append(name, x); d.onclick = () => openTask(t.id); box.append(d);
+  }
+  $('keystate').textContent = st.key ? 'Claude key set' : 'No Claude key';
+}
+function renderBar() {
+  const m = $('mode');
+  if (!m.options.length) for (const k of Object.keys(st.modes)) m.append(new Option({ask: 'Ask before changes', edits: 'Ask before commands', auto: 'Never ask'}[k] || k, k));
+  m.value = st.mode; m.title = st.modes[st.mode];
+  const pl = st.planners.find(x => x.id === st.planner) || st.planners[0];
+  const brand = st.planner === 'codex' ? 'Codex' : 'Claude';
+  $('cloudbtn').textContent = brand;
+  $('cloudbtn').title = brand + ' does the work itself (' + pl.label + '). The local model is not used.' +
+    (st.planner === 'api' ? '' : ' Its file changes are applied directly and shown afterwards; Undo puts them back.');
+  $('hybridbtn').title = brand + ' (' + pl.label + ') splits the job: steps marked [l] go to the local model, steps marked [c] it does itself.';
+  const mine = st.busy && st.busy === cur, b = $('send');
+  b.textContent = mine ? 'Stop' : 'Send'; b.className = mine ? '' : 'primary'; b.disabled = !cur || (!!st.busy && !mine);
+  $('undo').disabled = !undoN || !!st.busy; $('compact').disabled = !!st.busy || st.ctx_task !== cur;
+  const c = $('context'); c.textContent = '';
+  const used = st.ctx_task === cur ? st.ctx_used : 0;
+  if (st.engine) {
+    const meter = el('div', 'meter'); meter.append(Object.assign(el('i'), {style: 'width:' + Math.max(0.5, 100 * used / st.ctx).toFixed(1) + '%'}));
+    c.append(kv('Local context', used.toLocaleString() + ' of ' + st.ctx.toLocaleString()), meter);
+  } else c.append(kv('Local context', 'the model loads with the first request'));
+  c.append(kv('Local tokens written', st.usage.local.toLocaleString()));
+  if (st.usage.in || st.usage.out) c.append(kv('Claude tokens', st.usage.in.toLocaleString() + ' in, ' + st.usage.out.toLocaleString() + ' out'));
+  const lmNow = st.local_models.find(m => m.path === st.local_model);
+  c.append(kv('Local model', lmNow ? lmNow.label : st.local_model.split(/[\\/]/).slice(-2).join('/')));
+  c.append(kv('Cloud model', st.planner === 'api' ? st.model.replace('claude-', '') : (st.planners.find(x => x.id === st.planner) || {}).label || st.planner));
+}
+function kv(k, v) { const d = el('div', 'kv'); d.append(el('span', '', k), el('b', '', v)); return d; }
+function renderChanged() {
+  const c = $('changed'); c.textContent = ''; c.className = changed.length ? '' : 'dim';
+  if (!changed.length) c.textContent = 'Nothing changed in this task.';
+  for (const p of changed) { const f = el('div', 'f mono'); f.append(el('span', '', p)); f.title = p; f.onclick = () => openFile(p, 'diff'); c.append(f); }
+}
+async function renderTree(box, path) {
+  const r = await api('/api/tree?task=' + cur + '&path=' + encodeURIComponent(path));
+  box.textContent = '';
+  if (r.error) { box.append(el('div', 'dim', r.error)); return; }
+  for (const e of r.entries) {
+    const f = el('div', 'f'); f.append(el('span', 'dim', e.dir ? (openDirs.has(e.path) ? '▾' : '▸') : '·'), el('span', '', e.name)); f.title = e.path;
+    box.append(f);
+    if (e.dir) {
+      const kids = el('div', 'kids'); box.append(kids);
+      if (openDirs.has(e.path)) renderTree(kids, e.path);
+      f.onclick = () => { if (openDirs.has(e.path)) { openDirs.delete(e.path); kids.textContent = ''; f.firstChild.textContent = '▸'; } else { openDirs.add(e.path); f.firstChild.textContent = '▾'; renderTree(kids, e.path); } };
+    } else f.onclick = () => openFile(e.path, 'text');
+  }
+  if (!r.entries.length) box.append(el('div', 'dim', 'empty'));
+}
+let fileData = null;
+async function openFile(path, v) {
+  fileData = await api('/api/file?task=' + cur + '&path=' + encodeURIComponent(path));
+  if (fileData.error) { alert(fileData.error); return; }
+  $('filename').textContent = fileData.path;
+  $('fileview').style.display = fileData.diff ? '' : 'none';
+  showFile(fileData.diff ? v : 'text');
+  $('filedlg').showModal();
+}
+function showFile(v) {
+  for (const b of $('fileview').children) b.classList.toggle('on', b.dataset.v === v);
+  const pre = $('filebody'); pre.textContent = ''; pre.className = v === 'diff' ? 'diff' : '';
+  if (v === 'diff') for (const line of fileData.diff) pre.append(el('span', line[0] === '+' ? 'p' : line[0] === '-' ? 'm' : line[0] === '@' ? 'h' : '', line || ' '));
+  else pre.textContent = fileData.text;
+}
+
+// --- status bar ---
+function gauge(id, frac, text, title, high) {
+  const g = $(id);
+  g.querySelector('i').style.width = frac === null ? '0' : Math.max(1, Math.min(100, 100 * frac)).toFixed(1) + '%';
+  g.querySelector('b').textContent = text;
+  if (high !== undefined) g.querySelector('.bar').classList.toggle('high', high);
+  if (title) g.title = title;
+}
+const gb = b => (b / 1073741824).toFixed(b < 107374182400 ? 1 : 0);
+let lastSys = null;
+function renderSys(y) {
+  lastSys = y;
+  if (y.ram) gauge('g-ram', y.ram[0] / y.ram[1], gb(y.ram[0]) + ' / ' + gb(y.ram[1]) + ' GB',
+    'Physical memory in use on this computer' + (y.engine_ram ? '\nThe local model holds ' + gb(y.engine_ram) + ' GB of it' : ''), y.ram[0] / y.ram[1] > 0.92);
+  else gauge('g-ram', null, 'n/a');
+  if (y.vram) gauge('g-vram', y.vram[0] / y.vram[1], gb(y.vram[0]) + ' / ' + gb(y.vram[1]) + ' GB', '', y.vram[0] / y.vram[1] > 0.95);
+  else gauge('g-vram', null, 'n/a', 'No NVIDIA GPU was found');
+  const c = y.cache;
+  if (c) gauge('g-cache', c.last ?? c.all, Math.round(100 * (c.last ?? c.all)) + '%',
+    'Expert lookups served from VRAM instead of computed on the CPU\nLast reply: ' + (c.last === null ? 'n/a' : (100 * c.last).toFixed(1) + '%') +
+    '\nSince the model was loaded: ' + (100 * c.all).toFixed(1) + '%\nExperts held in VRAM: ' + c.cached.toLocaleString() + ' of ' + c.experts.toLocaleString());
+  else gauge('g-cache', null, '-', 'Share of expert lookups served from VRAM instead of computed on the CPU\nShown after the first reply of the local model');
+}
+
+// --- tasks ---
+async function openTask(id) {
+  const t = await api('/api/task?id=' + id);
+  if (t.error) return;
+  cur = id; task = t; items = t.items; rev = t.rev; changed = t.changed; undoN = t.undo;
+  localStorage.setItem('sicode-task', id);
+  $('title').textContent = t.title; $('folder').textContent = t.workspace.split(/[\\/]/).filter(Boolean).slice(-2).join(' / '); $('folder').title = 'Working folder: ' + t.workspace + (items.length ? '' : '\nClick to choose another');
+  openDirs.clear();
+  renderFeed(); renderSide(); renderBar(); renderChanged(); renderTree($('tree'), '');
+  $('text').focus();
+}
+async function newTask(workspace) {
+  const t = await api('/api/new', {workspace: workspace || (task && task.workspace) || ''});
+  if (t.error) { alert(t.error); return; }
+  await openTask(t.id);
+}
+function pick() {
+  const saved = localStorage.getItem('sicode-task');
+  const t = st.tasks.find(x => x.id === saved) || st.tasks[0];
+  if (t) openTask(t.id); else newTask(st.default_workspace);
+}
+async function send() {
+  const box = $('text'), text = box.value.trim();
+  if (st.busy === cur) { api('/api/stop', {}); return; }
+  if (!text || !cur || st.busy) return;
+  box.value = ''; grow();
+  const r = await api('/api/send', {task: cur, text, route});
+  if (r.error) { box.value = text; alert(r.error); }
+}
+function grow() { const t = $('text'); t.style.height = 'auto'; t.style.height = Math.min(220, t.scrollHeight) + 'px'; }
+
+// --- live events ---
+function connect() {
+  const es = new EventSource('/api/events?t=' + encodeURIComponent(token));
+  es.onmessage = m => {
+    const e = JSON.parse(m.data);
+    if (e.op === 'sys') { renderSys(e.sys); return; }
+    if (e.op === 'state') {
+      const first = !st; st = e.state;
+      if (first || !cur) pick();
+      else { renderSide(); renderBar(); const t = st.tasks.find(x => x.id === cur); if (t) $('title').textContent = t.title; }
+      return;
+    }
+    if (e.task !== cur) return;
+    if (e.op === 'changed') { changed = e.files; renderChanged(); renderTree($('tree'), ''); return; }
+    if (e.rev <= rev) return;
+    if (e.rev !== rev + 1) { openTask(cur); return; }  // missed something: reload the task
+    rev = e.rev;
+    if (e.op === 'add') { if (!items.length) $('feed').textContent = ''; items[e.item.id] = e.item; place(e.item); }
+    else if (e.op === 'append') { const it = items[e.id]; it.text = (it.text || '') + e.text; later(it); }
+    else if (e.op === 'update') { const it = items[e.id]; Object.assign(it, e.fields); place(it); }
+  };
+  es.onerror = () => { $('hint').textContent = 'Lost the connection to SiCode; retrying ...'; };
+  es.onopen = () => { $('hint').textContent = 'Enter sends, Shift+Enter adds a line. @path attaches a file from the folder.'; if (cur) openTask(cur); };
+}
+
+// --- wiring ---
+$('new').onclick = () => chooseFolder();  // a new task starts with choosing its folder
+$('send').onclick = send;
+$('text').addEventListener('input', grow);
+$('text').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
+$('route').onclick = e => { const b = e.target.closest('button'); if (!b) return; route = b.dataset.r; for (const x of $('route').children) x.classList.toggle('on', x === b);
+  if (route !== 'local' && st.planner === 'api' && !st.key) $('settings').click(); };
+$('mode').onchange = e => api('/api/mode', {mode: e.target.value});
+$('undo').onclick = async () => { const r = await api('/api/undo', {task: cur}); if (r.error) alert(r.error); else { undoN = r.undo; renderBar(); renderTree($('tree'), ''); } };
+$('compact').onclick = () => api('/api/send', {task: cur, text: '/compact', route: 'local'});
+$('fileview').onclick = e => { const b = e.target.closest('button'); if (b) showFile(b.dataset.v); };
+document.querySelectorAll('[data-close]').forEach(b => b.onclick = () => b.closest('dialog').close());
+function plannerNote() { const p = st.planners.find(x => x.id === $('planner').value);
+  $('plannernote').textContent = p.id === 'api' ? 'Uses the key below; billed per token by Anthropic.'
+    : p.found ? 'Uses the account you are signed in with in ' + (p.id === 'codex' ? 'Codex' : 'Claude Code') + '; no API key is involved. It can read the folder, and hands every change to the local model.'
+    : (p.id === 'codex' ? 'Codex' : 'Claude Code') + ' was not found on this computer. Install it and sign in first.'; }
+$('planner').onchange = plannerNote;
+$('settings').onclick = () => { const ps = $('planner'); ps.textContent = '';
+  for (const p of st.planners) ps.append(new Option(p.label + (p.found ? '' : ' (not installed)'), p.id)); ps.value = st.planner; plannerNote();
+  const lm = $('localmodel'); lm.textContent = '';
+  for (const m of st.local_models) lm.append(new Option(m.label + (m.default ? ' (default)' : ''), m.path));
+  lm.value = st.local_model; if (lm.value !== st.local_model) { lm.append(new Option(st.local_model, st.local_model)); lm.value = st.local_model; }
+  $('localnote').textContent = 'SiCode is built and tested with the 4-bit Qwen3.8-Flash-Next. Other models load the same way but may follow its tool format less reliably. Changing the model reloads it on the next request.';
+  $('vramcap').value = st.vram_cap || 0;
+  $('vramnote').textContent = 'The local model sizes its expert cache to stay under the cap; a lower cap is slower. ' +
+    (lastSys && lastSys.vram ? 'The card has ' + gb(lastSys.vram[1]) + ' GB; ' + gb(lastSys.vram[0]) + ' GB are in use now. ' : '') +
+    'Changing it reloads the model on the next request.';
+  $('model').value = st.model; if ($('model').value !== st.model) { $('model').append(new Option(st.model, st.model)); $('model').value = st.model; } $('effort').value = st.effort; $('key').value = ''; $('key').placeholder = st.key ? 'a key is set; type to replace it' : 'sk-ant-...'; $('setdlg').showModal(); };
+$('saveset').onclick = async () => { if ($('key').value.trim()) await api('/api/key', {key: $('key').value.trim()}); if ($('localmodel').value !== st.local_model) { const r = await api('/api/localmodel', {path: $('localmodel').value}); if (r.error) { alert(r.error); return; } }
+  const cap = parseFloat($('vramcap').value); if (!isNaN(cap) && cap !== (st.vram_cap || 0)) await api('/api/vramcap', {gb: cap});
+  await api('/api/planner', {planner: $('planner').value}); await api('/api/model', {model: $('model').value, effort: $('effort').value}); $('setdlg').close(); };
+let dirNow = '';
+async function showDirs(path) {
+  const r = await api('/api/dirs?path=' + encodeURIComponent(path));
+  dirNow = r.error ? '' : r.path; $('dirinput').value = r.path || ''; $('dirinput').placeholder = r.path ? '' : 'This computer: pick a drive below, or type a path';
+  $('usedir').disabled = !dirNow; $('direrr').textContent = r.error ? 'Cannot open that folder: ' + r.error : '';
+  const rec = $('recent'); rec.textContent = '';
+  const seen = [...new Set(st.tasks.map(t => t.workspace))].filter(w => w !== r.path).slice(0, 5);
+  if (seen.length) { rec.append(el('label', '', 'Recent folders')); for (const w of seen) { const x = el('div', 'dir mono', w); x.onclick = () => showDirs(w); rec.append(x); } }
+  const box = $('dirs'); box.textContent = '';
+  if (r.parent !== null && r.parent !== undefined) { const up = el('div', 'dir dim'); up.append(el('span', 'ic', '\u2191'), el('span', '', 'Up one level')); up.onclick = () => showDirs(r.parent); box.append(up); }
+  for (const d of r.dirs) { const x = el('div', 'dir'); x.append(el('span', 'ic', '\u{1F4C1}'), el('span', '', d.name)); x.onclick = () => showDirs(d.path); box.append(x); }
+  for (const f of r.files || []) { const x = el('div', 'dir file'); x.append(el('span', 'ic', '\u{1F4C4}'), el('span', '', f)); box.append(x); }
+  if (r.more) box.append(el('div', 'dir file', '... ' + r.more + ' more files'));
+  if (!r.dirs.length && !(r.files || []).length && !r.error) box.append(el('div', 'dir file', 'This folder is empty.'));
+  if (r.error) box.append(el('div', 'dim', r.error));
+}
+function chooseFolder() { showDirs(task ? task.workspace : st.default_workspace); $('dirdlg').showModal(); $('dirinput').focus(); $('dirinput').select(); }
+$('folder').onclick = chooseFolder;
+$('dirgo').onclick = () => showDirs($('dirinput').value.trim());
+$('dirbrowse').onclick = async () => { const b = $('dirbrowse'); b.disabled = true; b.textContent = 'Waiting for the dialog ...';
+  try { const r = await api('/api/pickdir', {start: dirNow || $('dirinput').value.trim()}); if (r.path) showDirs(r.path); else if (r.error) $('direrr').textContent = r.error; }
+  finally { b.disabled = false; b.textContent = 'Browse...'; } };
+$('dirinput').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); showDirs($('dirinput').value.trim()); } });
+$('usedir').onclick = async () => { const empty = task && !items.length ? cur : null; $('dirdlg').close(); await newTask(dirNow); if (empty) api('/api/delete', {task: empty}); };
+if (!token) document.body.innerHTML = '<div style="padding:40px;max-width:520px"><h2>SiCode</h2><p>Open the address SiCode printed when it started: it carries the access token.</p></div>';
+else connect();
+</script>
+</body>
+</html>

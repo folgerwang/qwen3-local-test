@@ -123,6 +123,12 @@ public:
         draft_ = w.has_mtp ? std::max(0, std::min(opt.draft, NT - 1)) : 0;
         if (const char* tp = std::getenv("QW_TRACE")) trace_ = std::fopen(tp, "ab");
         sys_free0_ = qw_system_free_vram(gpu_.device_name());  // before our buffers: Windows only counts them once used
+        // QW_VRAM_LIMIT_MB: the most VRAM this process may take (weights, state, K/V caches and expert cache).
+        // The free figure is what everything is sized from, and VRAM_MARGIN of it is always left unused.
+        if (const char* lim = std::getenv("QW_VRAM_LIMIT_MB")) {
+            const VkDeviceSize cap = ((VkDeviceSize)std::max(0ll, std::atoll(lim)) << 20) + VRAM_MARGIN;
+            sys_free0_ = sys_free0_ ? std::min(sys_free0_, cap) : cap;
+        }
         upload_weights();
         alloc_state();
         setup_experts();
@@ -208,6 +214,15 @@ public:
     int pos() const override { return pos_; }
     int max_ctx() const override { return max_ctx_; }
     const char* name() const override { return "vulkan"; }
+    bool cache_stats(CacheStats& s) const override {
+        s.hits = hits_;
+        s.misses = misses_;
+        s.cached = 0;
+        for (const auto& pool : slots_)
+            for (const Slot& sl : pool) s.cached += sl.key >= 0;
+        s.experts = n_keys();
+        return true;
+    }
 
     void save_state() override {
         gpu_.begin();

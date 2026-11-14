@@ -16,9 +16,10 @@ import subprocess
 import sys
 import time
 
-from . import __version__
+from . import __version__, planners
 from .tools import TOOLS, Workspace, clip
-from .worker import DEFAULT_EXE, DEFAULT_MODEL, DIRECT_PROMPT, WORKER_PROMPT, Engine, parse_reply, run_task
+from .worker import (DEFAULT_EXE, DEFAULT_MODEL, DIRECT_PROMPT, WORKER_PROMPT, Engine, local_models, parse_reply,
+                     run_task)
 
 DIM, BOLD, CYAN, YELLOW, RED, GREEN, OFF = "\033[2m", "\033[1m", "\033[36m", "\033[33m", "\033[31m", "\033[32m", "\033[0m"
 
@@ -34,7 +35,9 @@ MODES = {"ask": "asks before each file change and each shell command",
 
 HELP = f"""{BOLD}Requests{OFF}
   task             runs on the local model (same as [l] task)
-  [c] task         Claude plans and reviews, the local model does the work
+  [c] task         cloud: Claude (or Codex) does the work itself
+  [m] task         mix: Claude (or Codex) splits the job; steps marked [l] run on the local model, [c] it does itself
+                   ([h] is the same)
   @path            in a request: attaches that file's content
   !command         runs a shell command yourself, outside any model
   a line ending in \\ continues on the next line; Ctrl+C stops the current reply
@@ -48,6 +51,8 @@ HELP = f"""{BOLD}Requests{OFF}
   /init            have the local model write SICODE.md, the project notes loaded into every conversation
   /mode [name]     permission mode: ask, edits, auto
   /model [name]    Claude model for [c]: opus, sonnet, haiku, fable or a full model id
+  /local [number]  the local model: lists the installed ones, or switches to one
+  /planner [name]  who plans [c] requests: api (Claude API key), claude-code or codex (account login)
   /think           show or hide the local model's reasoning
   /key             set the Claude API key
   /exit            quit"""
@@ -96,41 +101,61 @@ def ask_for_key():
         return False
     os.environ["ANTHROPIC_API_KEY"] = key
     try:
-        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-        with open(CONFIG, "w", encoding="utf-8") as f:
-            json.dump({"anthropic_api_key": key}, f)
-        os.chmod(CONFIG, 0o600)
+        save_config(anthropic_api_key=key)
         print(f"{DIM}  saved to {CONFIG}{OFF}")
     except OSError as e:
         print(f"{DIM}  not saved ({e}); it is used for this run only{OFF}")
     return True
 
 
-ARCHITECT_PROMPT = """You are the architect in SiCode, a terminal coding assistant. The user works in a repository \
-(the workspace) and talks to you. You decide what should be done; a local model does the hands-on work.
+def vram_cap(a):
+    """The VRAM cap in GB: --vram-cap, else the saved setting, else 0 (none)."""
+    if a.vram_cap is not None:
+        return max(0.0, a.vram_cap)
+    try:
+        return max(0.0, float(load_config().get("vram_cap_gb") or 0))
+    except (TypeError, ValueError):
+        return 0.0
 
-The worker is Qwen3.8-Flash-Next (4-bit) running on the user's own GPU. It is free to run but slow (about 35 tokens \
-per second) and less capable than you. You reach it with the `delegate` tool: each call starts a fresh worker with \
-no memory of earlier tasks or of this conversation, and it works alone with read, write, edit, search and shell \
-tools until it reports back. Its report describes what it did; treat that as a claim, not as proof.
 
-How to split the work:
-- The user pays for your tokens and not for the worker's, so the worker does the reading, the editing and the \
-routine checks. Give it tasks of exploration too ("find where X is handled and report the functions involved").
-- Write each task so that someone who has seen nothing can do it: the goal and why it matters, the files or areas \
-involved if you know them, the constraints, what done looks like and how to check it, and what to report back. \
-Decide the design yourself; do not leave the hard decision to the worker.
-- Size tasks so one worker can finish them: one coherent change at a time, in sequence when later tasks depend on \
-earlier ones.
-- After a task that changes code, look at the diff that `delegate` returns, and read the code or run the tests \
-yourself when the change is risky or the report is vague. If the work is wrong, send a follow-up task that says \
-exactly what to fix.
+def load_config():
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
-Your own tools (`read_file`, `list_files`, `search`, `run_command`) are for deciding and verifying. You cannot edit \
-files; every change goes through the worker. The user sees each file change and shell command and may decline one.
 
-Answer questions that need no work on the repository directly. Tell the user plainly what was done, what was \
-verified and how, and what is still open. Keep your replies short: the user reads them in a terminal."""
+def save_config(**values):
+    """Merges values into ~/.sicode/config.json."""
+    cfg = {**load_config(), **values}
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    with open(CONFIG, "w", encoding="utf-8") as f:
+        json.dump(cfg, f)
+    os.chmod(CONFIG, 0o600)
+
+
+ARCHITECT_PROMPT = f"""You are the lead engineer in SiCode, a coding assistant. The user works in a repository \
+(the workspace) and talks to you.
+
+{planners.SPLIT}
+
+For a job with more than one step, call `update_plan` first and again whenever a state changes. Write the plan as \
+{planners.PLAN_FORMAT}
+
+To run an [l] step, call `delegate` with the complete brief: the goal and why it matters, the files or areas \
+involved, the constraints, what done looks like and how to check it, and what to report back. One coherent change \
+per brief, in sequence when later steps depend on earlier ones. After a task that changes code, look at the diff \
+that `delegate` returns, and read the code or run the tests yourself when the change is risky or the report is \
+vague. If the work is wrong, send a follow-up task that says exactly what to fix, or fix it yourself as a [c] step.
+
+To do a [c] step, use your own tools: `read_file`, `list_files`, `search`, `write_file`, `edit_file` and \
+`run_command`. The user sees each file change and shell command, yours and the worker's, and may decline one; if \
+they do, do not retry it, ask what they want instead.
+
+Answer questions that need no work on the repository directly, without a plan. Tell the user plainly what was done \
+and by whom, what was verified and how, and what is still open. Keep your replies short."""
 
 DELEGATE = {
     "name": "delegate",
@@ -140,7 +165,15 @@ DELEGATE = {
     "input_schema": {"type": "object", "additionalProperties": False, "required": ["task"],
                      "properties": {"task": {"type": "string", "description": "The complete brief for the worker."}}},
 }
-ARCHITECT_TOOLS = [DELEGATE] + [t for t in TOOLS if t["name"] in ("read_file", "list_files", "search", "run_command")]
+ARCHITECT_TOOLS = [DELEGATE] + TOOLS  # hybrid: Claude hands [l] steps to the worker and does [c] steps itself
+
+# [c]: Claude over the API does the work itself, with the same tools and permissions as the local model
+SOLO_API_PROMPT = """You are SiCode, a coding assistant working in the user's repository (the workspace). Carry \
+out the request yourself with the tools: read the relevant files before changing them, make the changes the \
+request asks for and no others, and check your work when there is a way to (build, run the tests). For a job with \
+several steps, call update_plan first and again as steps finish. The user sees each file change and shell command \
+and may decline one; if they do, do not retry it, ask what they want instead. Keep the final reply short: what \
+you did or found, what you ran and its result, and anything unfinished."""
 
 
 def valid_input(tool, args):
@@ -269,7 +302,11 @@ class App:
         self.undo = []           # (request, {path: content before}) per request that changed files
         self.show_thinking = False
         self.quiet_tools = False  # a delegated task: tool calls are indented under the task
+        self.by = ""             # hybrid: who is acting now, "c" (the cloud model) or "l" (the local model)
         self.instructions_name, self.instructions = self.load_instructions()
+        self.planner = a.planner if a.planner != "auto" else load_config().get("planner") or \
+            planners.default_planner(have_credentials())
+        self.planner_chat = None  # the Claude Code or Codex conversation, when [c] goes through an account login
 
     # --- project notes ---
 
@@ -284,6 +321,8 @@ class App:
     # --- permissions and what the tools show ---
 
     def approve_edit(self, path, old, new):
+        if self.by == "c":
+            print(f"  {CYAN}[c]{OFF}", end="")
         show_diff(path, old, new)
         if self.mode != "ask":
             return True
@@ -294,7 +333,7 @@ class App:
         return answer[:1] in ("y", "a")
 
     def approve_command(self, command):
-        print(f"{YELLOW}  $ {command}{OFF}")
+        print(f"{YELLOW}  {'[c] ' if self.by == 'c' else ''}$ {command}{OFF}")
         words = command.split()
         first = words[0].lower() if words else ""
         if self.mode == "auto" or first in self.allowed:
@@ -305,13 +344,14 @@ class App:
         return answer[:1] in ("y", "a")
 
     def show_plan(self, plan):
-        for line in plan.strip().splitlines():
-            line = line.strip()
+        for step in planners.parse_plan(plan):
+            mark = {"done": "[x]", "doing": "[~]", "todo": "[ ]"}[step["state"]]
+            line = f"{mark} " + (f"[{step['who']}] " if step["who"] else "") + step["text"]
             colour = GREEN if line.startswith("[x]") else YELLOW if line.startswith("[~]") else ""
             print(f"    {colour}{line}{OFF}")
 
     def show_call(self, name, args):
-        pad = "    " if self.quiet_tools else "  "
+        pad = "    " if self.quiet_tools else "  [c] " if self.by == "c" else "  "
         if name in ("write_file", "edit_file", "run_command", "update_plan"):
             if name == "update_plan":
                 print(f"{pad}{CYAN}plan{OFF}")
@@ -328,7 +368,7 @@ class App:
         if self.engine is None:
             print(f"{DIM}loading Qwen3.8-Flash-Next ...{OFF}", flush=True)
             t0 = time.time()
-            self.engine = Engine(self.a.exe, self.a.worker_model, self.a.backend)
+            self.engine = Engine(self.a.exe, self.a.worker_model, self.a.backend, vram_cap_gb=vram_cap(self.a))
             print(f"{DIM}local model ready in {time.time() - t0:.0f} s (context {self.engine.ctx:,} tokens){OFF}")
         return self.engine
 
@@ -394,7 +434,7 @@ class App:
     def delegate(self, task):
         engine = self.start_engine()
         self.ws.changed.clear()
-        print(f"  {CYAN}delegate{OFF} {DIM}{task.strip().splitlines()[0][:150]}{OFF}")
+        print(f"  {CYAN}[l] delegate{OFF} {DIM}{task.strip().splitlines()[0][:150]}{OFF}")
 
         def on_event(kind, data):
             if kind == "call":
@@ -407,11 +447,13 @@ class App:
         t0 = time.time()
         self.local_open = False  # the engine now holds this task, not the user's local conversation
         self.quiet_tools = True
+        by, self.by = self.by, "l"
         try:
             report, stats = run_task(engine, self.ws, task, on_event, effort=self.a.worker_effort,
                                      prompt=WORKER_PROMPT, instructions=self.instructions)
         finally:
             self.quiet_tools = False
+            self.by = by
         print(f"{DIM}    done: {stats['steps']} steps, {stats['gen_tokens']:,} tokens, {time.time() - t0:.0f} s{OFF}")
         changed = sorted(self.ws.changed)
         out = "WORKER REPORT\n" + report + "\n\nFILES CHANGED\n" + ("\n".join(changed) if changed else "none")
@@ -421,7 +463,7 @@ class App:
         return out
 
     def run_tool(self, block):
-        tool = next((t for t in ARCHITECT_TOOLS if t["name"] == block.name), None)
+        tool = next((t for t in [DELEGATE] + TOOLS if t["name"] == block.name), None)
         if tool is None or not valid_input(tool, block.input):
             return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
                     "content": "INVALID_JSON: the tool input did not match the schema; send the call again."}
@@ -433,10 +475,10 @@ class App:
             self.show_result(result)
         return {"type": "tool_result", "tool_use_id": block.id, "content": result}
 
-    def architect_turn(self, text):
+    def architect_turn(self, text, solo=False):
         self.messages.append({"role": "user", "content": text})
-        tools = [{**t, "eager_input_streaming": True} for t in ARCHITECT_TOOLS]
-        system = ARCHITECT_PROMPT
+        tools = [{**t, "eager_input_streaming": True} for t in (TOOLS if solo else ARCHITECT_TOOLS)]
+        system = SOLO_API_PROMPT if solo else ARCHITECT_PROMPT
         if self.instructions:
             system += f"\n\n# Project instructions ({self.instructions_name})\n\n{self.instructions}"
         extra = {}
@@ -485,13 +527,48 @@ class App:
             self.client = anthropic.Anthropic()
         return True
 
-    def claude_turn(self, text):
+    def login_turn(self, text, solo=False):
+        """[c] and [h] through Claude Code or Codex, signed in with the user's account."""
+        chat = self.planner_chat
+        if chat is None or chat.planner != self.planner or chat.solo != solo:
+            chat = self.planner_chat = planners.Planner(self.planner, self.ws.root, solo=solo)
+        chat.allow_shell = self.mode == "auto"
+        print(f"{DIM}  {planners.PLANNERS[self.planner]} is {'working' if solo else 'planning'} ...{OFF}", flush=True)
+        snap = [None]
+
+        def before_turn():  # the tool edits on its own: compare the workspace around each of its turns
+            snap[0] = self.ws.snapshot()
+
+        def after_turn():
+            for path, old, new in self.ws.changes_since(snap[0]):
+                mark = "" if solo else f"  {CYAN}[c]{OFF}"
+                if new is None:
+                    print(f"{mark}{CYAN}  deleted {path}{OFF}")
+                else:
+                    print(mark, end="")
+                    show_diff(path, old, new)
+
+        def on_plan(steps):
+            self.show_plan("\n".join({"done": "[x]", "doing": "[~]", "todo": "[ ]"}[x["state"]] +
+                                     (f" [{x['who']}] " if x["who"] else " ") + x["text"] for x in steps))
+
+        try:
+            planners.run(chat, text, self.delegate, lambda t: print(t, flush=True), on_plan=on_plan,
+                         before_turn=before_turn, after_turn=after_turn)
+        except KeyboardInterrupt:
+            chat.stop()
+            print(f"\n{YELLOW}[interrupted]{OFF}")
+
+    def claude_turn(self, text, solo=False):
+        if self.planner != "api":
+            return self.login_turn(text, solo)
         if not self.claude_ready():
             return
         mark = len(self.messages)
         an = self.anthropic
+        self.by = "" if solo else "c"
         try:
-            self.architect_turn(text)
+            self.architect_turn(text, solo)
         except KeyboardInterrupt:
             del self.messages[mark:]
             print(f"\n{YELLOW}[interrupted; that request was dropped from Claude's conversation]{OFF}")
@@ -507,6 +584,7 @@ class App:
         except an.APIConnectionError:
             del self.messages[mark:]
             print(f"{RED}Could not reach the Claude API (network).{OFF}")
+        self.by = ""
         u = self.usage
         print(f"{DIM}[Claude: {u['in']:,} in, {u['cache_read']:,} cached, {u['out']:,} out | "
               f"local: {u['local']:,} tokens]{OFF}")
@@ -528,16 +606,19 @@ class App:
         return out
 
     def turn(self, text, prompt=DIRECT_PROMPT):
-        """Routes one request: "[c] ..." to Claude, "[l] ..." or no prefix to the local model."""
+        """Routes one request: "[c]" the cloud model alone, "[h]" hybrid (it plans, the local model works),
+        "[l]" or no prefix the local model alone."""
         tag, rest = text[:3].lower(), text[3:].strip()
-        if tag not in ("[c]", "[l]"):
+        if tag == "[m]":  # mix: the other name of the hybrid mode
+            tag = "[h]"
+        if tag not in ("[c]", "[l]", "[h]"):
             tag, rest = "[l]", text
         if not rest:
             return
         self.ws.begin_turn()
         try:
-            if tag == "[c]":
-                self.claude_turn(self.attach(rest))
+            if tag in ("[c]", "[h]"):
+                self.claude_turn(self.attach(rest), solo=tag == "[c]")
             else:
                 self.local_turn(self.attach(rest), prompt)
         finally:
@@ -557,6 +638,7 @@ class App:
             print(HELP)
         elif name == "/clear":
             self.messages.clear()
+            self.planner_chat = None
             self.local_open, self.summary = False, ""
             print(f"{DIM}[conversations cleared]{OFF}")
         elif name == "/compact":
@@ -592,6 +674,34 @@ class App:
             if arg:
                 self.a.model = MODEL_ALIASES.get(arg.lower(), arg)
             print(f"{DIM}Claude model for [c]: {self.a.model}{OFF}")
+        elif name == "/planner":
+            if arg in planners.PLANNERS:
+                self.planner = arg
+                try:
+                    save_config(planner=arg)
+                except OSError:
+                    pass
+            elif arg:
+                print(f"{RED}unknown planner; choose {', '.join(planners.PLANNERS)}{OFF}")
+            for k, v in planners.PLANNERS.items():
+                found = "" if k == "api" or planners.find(k) else " (its tool is not installed)"
+                print(f"  {'*' if k == self.planner else ' '} {k:12s} {v}{found}")
+        elif name == "/local":
+            models = local_models()
+            if arg.isdigit() and 1 <= int(arg) <= len(models):
+                self.a.worker_model = models[int(arg) - 1]["path"]
+                try:
+                    save_config(local_model=self.a.worker_model)
+                except OSError:
+                    pass
+                if self.engine:  # the next request loads the chosen model
+                    self.engine.close()
+                    self.engine, self.local_open = None, False
+            elif arg:
+                print(f"{RED}give the number of a model from the list{OFF}")
+            for i, m in enumerate(models, 1):
+                on = os.path.normcase(m["path"]) == os.path.normcase(self.a.worker_model)
+                print(f"  {'*' if on else ' '} {i}  {m['label']}{' (default)' if m['default'] else ''}")
         elif name == "/think":
             self.show_thinking = not self.show_thinking
             print(f"{DIM}[local reasoning {'shown' if self.show_thinking else 'hidden'}]{OFF}")
@@ -614,10 +724,11 @@ class App:
 
     def repl(self):
         notes = f"project notes {self.instructions_name}" if self.instructions_name else "no project notes (/init)"
-        print(f"{BOLD}SiCode{OFF}  local Qwen3.8-Flash-Next, Claude {self.a.model} with [c]\n"
+        who = f"Claude {self.a.model}" if self.planner == "api" else planners.PLANNERS[self.planner]
+        print(f"{BOLD}SiCode{OFF}  local Qwen3.8-Flash-Next; [c] plans with: {who}\n"
               f"{DIM}workspace {self.ws.root}\nmode {self.mode}: {MODES[self.mode]}; {notes}\n"
               f"/help lists the commands{OFF}")
-        if not have_credentials():
+        if self.planner == "api" and not have_credentials():  # an account login needs no key
             ask_for_key()
         while True:
             try:
@@ -648,8 +759,9 @@ class App:
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="sicode", description="Requests run on the local Qwen3.8-Flash-Next; start one with [c] "
-                                             "to have Claude plan and review it.")
+    ap = argparse.ArgumentParser(prog="sicode", description="Requests run on the local Qwen3.8-Flash-Next. Start one with "
+                                 "[c] to have Claude or Codex do it instead, or with [m] (mix) to have it split the job "
+                                 "between itself and the local model.")
     ap.add_argument("--dir", default=os.getcwd(), help="workspace (default: the current directory)")
     ap.add_argument("--mode", default="ask", choices=list(MODES),
                     help="ask before file changes and shell commands (default), only before commands (edits), or never (auto)")
@@ -660,9 +772,19 @@ def main():
     ap.add_argument("--worker-effort", default="low", choices=["low", "medium", "xhigh"],
                     help="reasoning effort of the local model")
     ap.add_argument("--exe", default=DEFAULT_EXE, metavar="PATH", help="the engine (default: the bundled qwen.exe)")
-    ap.add_argument("--worker-model", default=DEFAULT_MODEL, metavar="PATH", help="folder of the local model")
+    ap.add_argument("--worker-model", default=None, metavar="PATH",
+                    help="folder of the local model (default: the saved choice, else the 4-bit Qwen3.8-Flash-Next)")
+    ap.add_argument("--vram-cap", type=float, default=None, metavar="GB",
+                    help="the most VRAM that may be in use on the card, counting other programs (default: the saved "
+                         "setting, else no cap); the local model sizes its expert cache to stay under it")
     ap.add_argument("--backend", default="vulkan", choices=["vulkan", "cpu"], help="where the local model runs")
-    ap.add_argument("-p", "--prompt", help="run one request and exit; may start with [c] or [l]")
+    ap.add_argument("-p", "--prompt", help="run one request and exit; may start with [l] local, [c] cloud or [m] mix")
+    ap.add_argument("--planner", default="auto", choices=["auto", *planners.PLANNERS],
+                    help="who plans [c] requests: the Claude API key, or an account login through Claude Code or "
+                         "Codex (default: the last choice, else an installed login tool)")
+    ap.add_argument("--web", action="store_true", help="open SiCode as a page in the browser instead of the terminal")
+    ap.add_argument("--port", type=int, default=8765, help="port of the --web page (default 8765; 0 picks a free one)")
+    ap.add_argument("--no-browser", action="store_true", help="with --web: print the address, do not open it")
     ap.add_argument("--download-model", action="store_true",
                     help="download the local model (about 115 GB) to ~/.sicode/models and exit")
     ap.add_argument("--version", action="version", version="sicode " + __version__)
@@ -673,10 +795,16 @@ def main():
         return
     if a.yes:
         a.mode = "auto"
+    if not a.worker_model:  # the choice made with /local or in the page's Settings, while that folder exists
+        saved = load_config().get("local_model")
+        a.worker_model = saved if saved and os.path.exists(saved) else DEFAULT_MODEL
     a.model = MODEL_ALIASES.get(a.model.lower(), a.model)
     os.system("")  # turns on ANSI colours in the Windows console
     for s in (sys.stdout, sys.stderr):
         s.reconfigure(encoding="utf-8", errors="replace")
+    if a.web:
+        from .web import serve
+        return serve(a)
     load_saved_key()
     app = App(a)
     if a.prompt:

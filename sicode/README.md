@@ -1,19 +1,21 @@
 # SiCode
 
-A terminal coding assistant in two layers:
+A coding assistant for the terminal and the browser, built on two models:
 
-- **Architect: Claude, over the Claude API.** It talks to you, decides what to do, writes self-contained tasks,
-  and reviews the result (the worker's report and the git diff). It can read, search and run commands, but it
-  cannot edit files.
-- **Worker: Qwen3.8-Flash-Next, in `qwen.exe` on your GPU.** Each task starts a fresh worker that reads, edits
-  and runs things with its own tool loop until it reports back.
+- **The local model: Qwen3.8-Flash-Next, in `qwen.exe` on your GPU.** It reads, edits and runs things with its own
+  tool loop. Free to run, slower and less capable than a cloud model.
+- **A cloud model: Claude or Codex.** Reached with a Claude API key, or with your Claude or ChatGPT account through
+  the vendor's own command-line tool (Claude Code, Codex).
+
+Each request runs in one of three modes: **local** (the local model alone), **cloud** (the cloud model alone) or
+**mix** (the cloud model splits the job into steps and gives each to the local model or to itself).
 
 ## Install
 
 On 64-bit Windows, from the wheel on the [releases page](https://github.com/folgerwang/qwen3-local-test/releases):
 
 ```
-pip install sicode-0.2.0-py3-none-win_amd64.whl
+pip install sicode-0.2.1-py3-none-win_amd64.whl
 sicode --download-model
 ```
 
@@ -36,7 +38,8 @@ set SICODE_MODEL=G:\work\qwen3-local-test\models\Qwen3.8-Flash-Next-GGUF\UD-Q4_K
 cd your-project
 sicode                                        # interactive
 sicode -p "add a --json flag to the cli"      # one request, on the local model
-sicode -p "[c] redesign the config loading"   # one request, planned and reviewed by Claude
+sicode -p "[m] redesign the config loading"   # mix: the cloud model splits the job between the two
+sicode -p "[c] redesign the config loading"   # cloud: Claude or Codex does it
 python -m sicode                              # the same as sicode
 ```
 
@@ -44,15 +47,35 @@ Each request says who takes it:
 
 | Request | Who handles it |
 |---|---|
-| `[c] task` | Claude plans, hands the hands-on work to the local model, and reviews the result |
-| `[l] task` | the local model alone |
-| `task` (no prefix) | the local model alone |
+| `[l] task` or `task` (no prefix) | local: the local model alone |
+| `[m] task` (or `[h]`) | mix: the cloud model plans the job as steps and assigns each one, see below |
+| `[c] task` | cloud: the cloud model does the work itself; the local model is not used |
 
-Only `[c]` requests use the Claude API. If no key is set, SiCode asks for one when it starts (typed hidden; Enter
-skips it) and saves it in `~/.sicode/config.json` for later runs; `/key` asks again, and `ANTHROPIC_API_KEY` in the
-environment takes precedence over the saved key. The two sides keep
-separate conversations: consecutive local requests continue one conversation, `[c]` requests continue Claude's,
-and neither sees the other's. A `[c]` request that delegates work starts the local conversation afresh.
+Before 0.2.1, `[c]` meant what `[m]` means now.
+
+In the mix mode the cloud model assigns every step by ability and cost. Steps marked `[l]` go to the local
+model, which is free but slow and less capable: mechanical edits, boilerplate, tests for specified behaviour,
+exploration, builds and test runs. Steps marked `[c]` it does itself: the design, subtle bugs, changes that must be
+right across several files, the final review, and edits too small to be worth a brief. The plan, every hand-off and
+every file change carry the mark of who did it.
+
+The cloud model is chosen with `--planner`, `/planner` or Settings in the page, and remembered:
+
+| Planner | Signs in with | Notes |
+|---|---|---|
+| `claude-code` | your Claude account, through Claude Code | no API key; the default when `claude` is installed |
+| `codex` | your ChatGPT account, through Codex | no API key; needs Codex's sandbox to work on your machine |
+| `api` | a Claude API key | billed per token; asked for at start, `/key` asks again |
+
+With an account login SiCode runs the vendor's tool in the working folder and never sees the account's credentials.
+The tool edits files itself, in the cloud mode and for its own `[c]` steps of the mix mode: SiCode cannot ask
+before each of those changes, so it shows them afterwards as diffs and `/undo` puts them back. Claude Code may run
+shell commands only when the permission mode is `auto` (otherwise commands are `[l]` steps); Codex runs them inside
+its own sandbox. With the API key, the cloud model uses SiCode's own tools and asks like the local model does.
+
+The local and the cloud side keep separate conversations: consecutive local requests continue one conversation,
+cloud and mix requests continue the cloud model's, and neither sees the other's. A mix request that hands off
+work starts the local conversation afresh.
 
 ### In a session
 
@@ -77,6 +100,34 @@ diff. Ctrl+C stops the current reply and keeps the conversation.
 | `/key` | sets the Claude API key |
 | `/exit`, `exit`, `quit` | leaves SiCode |
 
+### In the browser
+
+```
+sicode --web                     # opens http://127.0.0.1:8765/?t=... in the browser
+sicode --web --dir D:\project --port 9000 --no-browser
+```
+
+The same assistant as a page, organised by task:
+
+- **Tasks** in the left column. "New task" first asks for the working folder: type or paste a path, pick a recent
+  folder, walk through the folders (their files are listed too), or press Browse for the Windows folder dialog. Each task has its own folder and conversation and is saved in `~/.sicode/tasks`, so it is
+  still there after a restart. Going back to an older task continues it from its transcript.
+- **The conversation** in the middle: replies as they are written, each file read, each command with its output,
+  each file change as a diff. In the `ask` mode a change or a command waits for Allow, Always allow or Decline.
+- **Local, Mix or Claude (Codex)** next to the Send button chooses the mode of the request, like `[l]`, `[m]`
+  and `[c]`. Stop interrupts the reply.
+- **Progress, changed files, the folder and the context** on the right. A changed file opens with its changes; Undo
+  puts back the files of the last request; Compact replaces the local conversation by its summary.
+- **Settings** holds the cloud model (account login or API key), the VRAM cap, the Claude API key and model.
+- **The bar at the top** shows the RAM and the VRAM in use (all programs, refreshed every two seconds) and the VRAM
+  cache rate: the share of expert lookups of the last reply that were served from VRAM instead of computed on the
+  CPU. Hovering shows the rate since the model was loaded and how many experts are cached.
+
+The local model holds one conversation at a time, so one request runs at a time. The page is served only on
+127.0.0.1 and every request needs the token in the address that `sicode --web` prints (kept in
+`~/.sicode/config.json`, so the address can be bookmarked). Anyone who can open that address can run shell commands
+as you: do not forward the port.
+
 ### Permissions
 
 | Mode | File changes | Shell commands |
@@ -95,6 +146,13 @@ the workspace root but are otherwise not sandboxed. With `-p` and no terminal, n
 `SICODE.md` at the workspace root (or, failing that, `CLAUDE.md` or `AGENTS.md`) is loaded into every conversation,
 local and Claude. `/init` writes it.
 
+### VRAM cap
+
+By default the local model takes the VRAM that is free when it loads, less a 2 GB margin, for its expert cache.
+`--vram-cap GB` (or Settings in the page; remembered) sets the most VRAM that may be in use on the card, counting
+other programs: the model sizes its cache to stay under it. A lower cap is slower (measured on an RTX 5090: about
+1.5 tok/s per GB of cache). The cap is applied when the model loads, from what other programs hold at that moment.
+
 ### Options
 
 `--mode`, `--dir PATH` (the workspace), `--model` and `--effort` (the Claude model and its effort, default
@@ -104,6 +162,9 @@ local and Claude. `/init` writes it.
 ## Modules
 
 - `sicode.cli`: the terminal front end and the architect loop.
+- `sicode.planners`: the cloud model through an account login (Claude Code, Codex).
+- `sicode.sysinfo`: RAM and VRAM figures for the page's status bar.
+- `sicode.web`: the browser front end (`--web`): a local HTTP server, with the page in `sicode/webui/index.html`.
 - `sicode.worker`: the engine process (`Engine`) and the worker's tool loop (`run_task`), in the tool-call format
   of the model's chat template.
 - `sicode.tools`: the file and shell tools both layers use (`Workspace`, `TOOLS`).

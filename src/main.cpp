@@ -557,11 +557,15 @@ int main(int argc, char** argv) {
                         o.interrupt_file = intr ? intr->as_str() : "";
                         const Turn t = run_turn(req["user"].as_str(), first, true);
                         first = false;
-                        char num[256];
+                        char num[512];
+                        Backend::CacheStats cs;  // all zero for a backend without an expert cache
+                        be->cache_stats(cs);
                         std::snprintf(num, sizeof num, ",\"finished\":%s,\"interrupted\":%s,\"gen_tokens\":%d,\"prefill_tokens\":%zu,"
-                                      "\"gen_tps\":%.2f,\"prefill_tps\":%.1f,\"ctx_used\":%d,\"ctx\":%d}",
+                                      "\"gen_tps\":%.2f,\"prefill_tps\":%.1f,\"ctx_used\":%d,\"ctx\":%d,"
+                                      "\"expert_hits\":%llu,\"expert_misses\":%llu,\"experts_cached\":%llu,\"experts\":%llu}",
                                       t.ended ? "true" : "false", t.interrupted ? "true" : "false", t.n_gen, t.n_prefill, t.n_gen / std::max(t.gen_s, 1e-9),
-                                      t.n_prefill / std::max(t.prefill_s, 1e-9), be->pos(), be->max_ctx());
+                                      t.n_prefill / std::max(t.prefill_s, 1e-9), be->pos(), be->max_ctx(),
+                                      cs.hits, cs.misses, cs.cached, cs.experts);
                         reply = "{\"text\":" + json_quote(t.text) + num;
                     }
                 } catch (const std::exception& e) {

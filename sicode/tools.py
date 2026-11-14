@@ -5,7 +5,7 @@ import re
 import subprocess
 
 MAX_OUT = 20000  # characters of tool output handed back to a model
-SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "build", "dist", ".vs", "models"}
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "build", "dist", ".vs", "models", ".pytest_cache"}
 
 
 def clip(text, limit=MAX_OUT):
@@ -68,9 +68,42 @@ class Workspace:
                 if os.path.exists(p):
                     os.remove(p)
             else:
+                os.makedirs(os.path.dirname(p), exist_ok=True)  # the file may have been deleted with its folder
                 with open(p, "w", encoding="utf-8", newline="") as f:
                     f.write(old)
         return sorted(backups)
+
+    def snapshot(self, max_files=8000, max_size=1_000_000):
+        """The text files of the workspace, {path: content}: taken before a tool that edits on its own runs."""
+        snap = {}
+        for p in self.walk():
+            if len(snap) >= max_files:
+                break
+            try:
+                if os.path.getsize(p) <= max_size:
+                    with open(p, encoding="utf-8", newline="") as f:
+                        snap[self.rel(p)] = f.read()
+            except (UnicodeDecodeError, OSError):
+                continue
+        return snap
+
+    def changes_since(self, snap):
+        """[(path, old, new)] for files that differ from the snapshot (old None: new file, new None: deleted).
+
+        Records them like the changes of SiCode's own tools, so they can be undone.
+        """
+        now = self.snapshot()
+        out = []
+        for r in sorted(set(snap) | set(now)):
+            old, new = snap.get(r), now.get(r)
+            if old == new:
+                continue
+            if new is None and os.path.exists(self.path(r)):
+                continue  # still there, only no longer readable as text
+            out.append((r, old, new))
+            self.backups.setdefault(r, old)
+            self.changed.add(r)
+        return out
 
     # --- tools: each returns the text shown to the model ---
 

@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sicode"
-version = "0.2.0"
+version = "0.2.1"
 description = "Terminal coding assistant: Claude plans and reviews, a local Qwen3.8-Flash-Next does the work"
 readme = "sicode/README.md"
 requires-python = ">=3.10"

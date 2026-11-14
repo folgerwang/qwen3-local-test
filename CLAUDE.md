@@ -113,3 +113,22 @@ generation from 11 to about 24 tok/s.
   projection of the current expert mix) do not reach it.
 - The engine sometimes ended without writing its `--eval` output (exit code 0, empty stdout, about a quarter of
   runs on that machine); `main.cpp` now flushes explicitly. Why the process ends that way is not known.
+
+## SiCode 0.2.1 (2026-11-13)
+
+- Three modes per request: local (`[l]` or no prefix), cloud (`[c]`, the cloud model alone) and mix (`[m]` or
+  `[h]`, the cloud model splits the job into steps marked `[l]` and `[c]`). Before 0.2.1 `[c]` meant mix.
+- The cloud model is the Claude API key or an account login through the vendor's CLI (`sicode/planners.py`):
+  `claude -p` (tested, with the API key removed from its environment) or `codex exec` (replies, but its Windows
+  sandbox failed with `CreateProcessWithLogonW failed: 1385` when started from a Claude Code session; unverified).
+  The CLI edits files itself, so SiCode snapshots the workspace around each of its turns to show diffs and undo.
+- `sicode --web` (`sicode/web.py`, page in `sicode/webui/index.html`): tasks, approvals, status bar (RAM, VRAM,
+  VRAM cache rate), Settings (cloud model, local model, VRAM cap). 127.0.0.1 only, token in the URL.
+- Engine additions for it: `--pipe` replies carry `expert_hits`, `expert_misses`, `experts_cached`, `experts`;
+  `QW_VRAM_LIMIT_MB` caps what the process may take (SiCode's VRAM cap minus what other programs hold).
+- An interrupt must always drain the engine's final reply: raising out of the delta callback once left a reply in
+  the pipe and every later answer belonged to the previous question (`Engine.turn` in `sicode/worker.py`).
+- The Windows wheel is built with the engine copied to `sicode/bin/qwen.exe` (git-ignored), then
+  `python -m wheel tags --platform-tag win_amd64 --remove`.
+- Shells started by Claude Code set `NoDefaultCurrentDirectoryInExePath`, so `cmd` there does not find a `.bat` in
+  the current folder by bare name; use `.\name.bat`.

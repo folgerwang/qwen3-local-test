@@ -1,5 +1,7 @@
 # qwen3-local-test
 
+![SiCode in the browser: a Mix-mode task, with steps marked [l] for the local model and [c] for Claude](docs/sicode-mix.png)
+
 From-scratch C++ inference engine for Qwen MoE models (CPU AVX-512 + hand-written Vulkan compute shaders, no ML libraries).
 
 - **Qwen3.8-Flash-Next 128B** from Unsloth's 4-bit **UD-Q4_K_XL** GGUF (the default model and format). The GGUF is read
@@ -8,20 +10,26 @@ From-scratch C++ inference engine for Qwen MoE models (CPU AVX-512 + hand-writte
 
 ## SiCode
 
-A terminal coding assistant built on this engine: requests run on the local Qwen3.8-Flash-Next, and a request that
-starts with `[c]` is planned and reviewed by Claude over the Claude API while the local model does the work.
+A coding assistant for the terminal and the browser, built on this engine. Requests run on the local
+Qwen3.8-Flash-Next; `[m]` (mix) has Claude or Codex split the job between itself and the local model, and `[c]` has
+Claude or Codex do it alone. The cloud model signs in with your Claude or ChatGPT account (through Claude Code or
+Codex) or with a Claude API key.
 
-**Download:** [sicode-0.2.0-py3-none-win_amd64.whl](https://github.com/folgerwang/qwen3-local-test/releases/download/sicode-v0.2.0/sicode-0.2.0-py3-none-win_amd64.whl)
+**Download:** [sicode-0.2.1-py3-none-win_amd64.whl](https://github.com/folgerwang/qwen3-local-test/releases/download/sicode-v0.2.1/sicode-0.2.1-py3-none-win_amd64.whl)
 ([all releases](https://github.com/folgerwang/qwen3-local-test/releases))
 
 ```
-pip install sicode-0.2.0-py3-none-win_amd64.whl
+pip install sicode-0.2.1-py3-none-win_amd64.whl
 sicode --download-model        # once: the local model, about 115 GB, to ~/.sicode/models
 cd your-project
-sicode
+sicode                         # in the terminal
+sicode --web                   # as a page in the browser (the screenshot above)
 ```
 
 ![Installing SiCode and listing its command-line options in cmd](docs/sicode-cmd.png)
+
+`sicode --web` opens the same assistant as a page in the browser: tasks, live progress, approvals and the files it
+changed.
 
 The wheel holds the assistant and a prebuilt engine (`qwen.exe`) for 64-bit Windows; nothing has to be compiled. It
 needs Python 3.10 or later, a CPU with AVX-512, a GPU with a Vulkan 1.3 driver (`--backend cpu` runs without one,

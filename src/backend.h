@@ -33,6 +33,11 @@ public:
     virtual void forward_all(const int* tokens, int n, float* logits) { (void)tokens; (void)n; (void)logits; }
     // Keeps the first `keep` (>= 1) tokens of the last forward_all() and drops the rest.
     virtual void accept(int keep) { (void)keep; }
+
+    // Expert cache counters since the start (backends that keep experts in a VRAM cache): lookups served from
+    // the cache and by the CPU, experts cached now and experts in the model. False when there is no such cache.
+    struct CacheStats { unsigned long long hits = 0, misses = 0, cached = 0, experts = 0; };
+    virtual bool cache_stats(CacheStats& s) const { (void)s; return false; }
 };
 
 std::unique_ptr<Backend> make_cpu_backend(const Config& cfg, const ModelWeights& w, int max_ctx, int threads);

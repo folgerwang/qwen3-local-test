@@ -5,6 +5,7 @@ import re
 import subprocess
 import tempfile
 
+from . import sysinfo
 from .tools import TOOLS
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,6 +25,41 @@ DEFAULT_EXE = os.environ.get("SICODE_ENGINE") or _first([
 DEFAULT_MODEL = os.environ.get("SICODE_MODEL") or _first([
     os.path.join(REPO, "models", MODEL_DIR, MODEL_QUANT),
     os.path.join(HOME_MODELS, MODEL_DIR, MODEL_QUANT)])
+
+
+def local_models():
+    """The model folders found next to the engine's checkout and in ~/.sicode/models: [{path, label}].
+
+    A GGUF quantisation is a folder of .gguf files (models/<name>/<quant>); an FP8 model is a folder named *-FP8
+    with safetensors. The 4-bit Flash-Next, the default, comes first.
+    """
+    found = {}
+    for base in (os.path.join(REPO, "models"), HOME_MODELS):
+        if not os.path.isdir(base):
+            continue
+        for name in sorted(os.listdir(base)):
+            d = os.path.join(base, name)
+            if not os.path.isdir(d):
+                continue
+            try:
+                for sub in sorted(os.listdir(d)):
+                    q = os.path.join(d, sub)
+                    if os.path.isdir(q) and any(f.endswith(".gguf") for f in os.listdir(q)):
+                        found.setdefault(os.path.normcase(q), {"path": q, "label": f"{name.removesuffix('-GGUF')} ({sub}, GGUF)"})
+                if name.upper().endswith("-FP8") and any(f.endswith(".safetensors") for f in os.listdir(d)):
+                    found.setdefault(os.path.normcase(d), {"path": d, "label": f"{name.removesuffix('-FP8')} (FP8)"})
+            except OSError:
+                continue
+    out = list(found.values())
+    key = os.path.normcase(DEFAULT_MODEL)
+    if os.path.exists(DEFAULT_MODEL) and key not in found:
+        out.append({"path": DEFAULT_MODEL, "label": os.path.basename(os.path.dirname(DEFAULT_MODEL)) or DEFAULT_MODEL})
+    for m in out:
+        m["default"] = os.path.normcase(m["path"]) == key
+        if m["default"]:
+            m["label"] = m["label"].replace("UD-Q4_K_XL, GGUF", "4-bit, UD-Q4_K_XL")
+    out.sort(key=lambda m: (not m["default"], m["label"].lower()))
+    return out
 
 
 def download_model(dst=None):
@@ -141,7 +177,8 @@ def parse_reply(text):
 class Engine:
     """qwen.exe --pipe: one JSON request per line in, JSON lines out. The engine holds the conversation."""
 
-    def __init__(self, exe=DEFAULT_EXE, model=DEFAULT_MODEL, backend="vulkan", extra=()):
+    def __init__(self, exe=DEFAULT_EXE, model=DEFAULT_MODEL, backend="vulkan", extra=(), vram_cap_gb=0):
+        """vram_cap_gb: the most VRAM that may be in use on the card, counting other programs (0: no cap)."""
         if not os.path.exists(exe):
             raise RuntimeError(f"{exe} not found: build the engine (setup.bat) or set SICODE_ENGINE")
         if not os.path.exists(model):
@@ -153,11 +190,20 @@ class Engine:
         self.log = open(self.log_path, "w", encoding="utf-8", errors="replace")
         # its own process group: Ctrl+C in the console interrupts the assistant, not the loaded model
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        env = dict(os.environ)
+        self.vram_limit_mb = None
+        if vram_cap_gb and vram_cap_gb > 0:
+            # the engine is told how much it may take itself: the cap less what other programs hold right now
+            now = sysinfo.vram()
+            others = (now[0] >> 20) if now else 0
+            self.vram_limit_mb = max(0, int(vram_cap_gb * 1024) - others)
+            env["QW_VRAM_LIMIT_MB"] = str(self.vram_limit_mb)
         self.proc = subprocess.Popen([os.path.abspath(exe), "--pipe", "--model", os.path.abspath(model), "--backend", backend, *extra],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
-                                     creationflags=flags)
+                                     creationflags=flags, env=env)
         self.ctx = self._read()["ctx"]
         self.ctx_used = 0
+        self.cache = {"hits": 0, "misses": 0, "last": None, "cached": 0, "experts": 0}
 
     def _read(self):
         line = self.proc.stdout.readline()
@@ -189,26 +235,38 @@ class Engine:
                "interrupt_file": self.stop_path}
         if system:
             req["system"] = system
+        if os.path.exists(self.stop_path):  # left by an interrupt() that came after its reply had ended
+            os.remove(self.stop_path)
         self._write(req)
         interrupted = False
         while True:
+            # the final reply is always read, also when interrupted: it must not be left in the pipe
             try:
                 msg = self._read()
-            except KeyboardInterrupt:
+                if "delta" in msg:
+                    if on_delta and not interrupted:
+                        on_delta(msg["delta"])
+                    continue
+            except KeyboardInterrupt:  # Ctrl+C, or raised by on_delta
                 interrupted = True
                 open(self.stop_path, "w").close()
                 continue
-            if "delta" in msg:
-                if on_delta and not interrupted:
-                    on_delta(msg["delta"])
-                continue
             break
         self.ctx_used = msg.get("ctx_used", self.ctx_used)
-        if interrupted:
+        hits, misses = msg.get("expert_hits", 0), msg.get("expert_misses", 0)
+        if hits + misses:  # the VRAM expert cache: lookups it served in this reply, and since the start
+            dh, dm = hits - self.cache["hits"], misses - self.cache["misses"]
+            self.cache = {"hits": hits, "misses": misses, "last": dh / (dh + dm) if dh + dm else self.cache["last"],
+                          "cached": msg.get("experts_cached", 0), "experts": msg.get("experts", 0)}
+        if interrupted or msg.get("interrupted"):  # Ctrl+C here, or interrupt() from another thread
             if os.path.exists(self.stop_path):
                 os.remove(self.stop_path)
             raise KeyboardInterrupt
         return msg
+
+    def interrupt(self):
+        """Stops the reply being generated, from another thread: turn() then raises KeyboardInterrupt there."""
+        open(self.stop_path, "w").close()
 
     def close(self):
         if self.proc.poll() is None:
